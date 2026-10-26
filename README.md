@@ -4,7 +4,7 @@ An independently maintained fork of `react-native-ble-plx`, rebuilt for **Expo S
 58 / React Native 0.88 and Expo Modules 2.0 beta**. Version 4 is a clean API break.
 Swift and Kotlin annotations replace the React Native bridge. TypeScript source
 is the public implementation; Bun handles installs, checks, linting, formatting,
-tests and the config-plugin build.
+tests and package verification.
 
 The radio engines remain MultiplatformBleAdapter 0.2.0 on iOS and RxAndroidBle
 1.17.2 on Android. Their internal Base64 and callback formats stop at the native
@@ -19,9 +19,33 @@ Install this fork, rather than the upstream npm release:
 bun add github:Human-Exploration-Company/react-native-ble-plx#v4.0.0-alpha.1
 ```
 
-This is the first alpha of version 4. The generated CommonJS config plugin is
-included; consumers do not need an install lifecycle script. See the
+This is the first alpha of version 4. The config plugin ships as TypeScript;
+consumers do not need a build or install lifecycle script. See the
 [release notes](RELEASE.md) and validation limits before using it with hardware.
+
+For Bun apps, apply the included Expo loader patch in the **app's** package.json.
+It makes Expo use Bun's native TypeScript loader, matching `slopper-topper`.
+Dependency patches do not propagate from this library into consuming apps.
+After installing the library, copy the patch:
+
+```sh
+mkdir -p patches
+cp node_modules/react-native-ble-plx/patches/@expo%2Frequire-utils@58.0.4.patch patches/expo-bun-loader.patch
+```
+
+Merge this entry into your app's `patchedDependencies`, then run `bun install`:
+
+```json
+{
+  "patchedDependencies": {
+    "@expo/require-utils@58.0.4": "patches/expo-bun-loader.patch"
+  }
+}
+```
+
+Keep the patch and updated lockfile in your app's repository. Apps already using
+the same reference patch need no additional patch. Node uses Expo's own TypeScript
+loader without the Bun workaround.
 
 ```ts
 // app.config.ts
@@ -122,6 +146,7 @@ the Apple engine retains its platform behavior. Read the exported types in
 nix develop
 bun install --frozen-lockfile
 bun run verify
+bun run verify:package
 bun run doctor
 bun run export:native
 
@@ -138,11 +163,11 @@ uses Noxcturnal. Node 24 remains available for native tooling that requires it.
 A narrow locked patch lets Expo's config loader use Bun's native TypeScript
 loader; it is copied from `slopper-topper`.
 
-The config plugin is authored in `app.plugin.ts`. `bun run build` generates the
-committed `app.plugin.js` entry directly; `bun run build --check` catches stale
-output. SDK 58 discovers TypeScript plugin entry points, but its unpatched config
-loader fails under Bun. Shipping generated JavaScript keeps packed consumers
-working under both Bun and Node without our local tooling patch or install hooks.
+The config plugin ships directly as `app.plugin.ts`. There is no generated
+JavaScript entry point or plugin build step. The tracked Expo loader patch makes
+this work with Bun. `bun run verify:package` packs the library, installs it in an
+isolated app with the shipped patch, and checks plugin loading and native mods
+under both Bun and Node. CI runs the same check.
 `bun pm pack --destination dist` builds a distributable archive.
 `bun run agents:setup` installs relevant Expo agent skills locally.
 

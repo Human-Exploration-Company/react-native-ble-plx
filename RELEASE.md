@@ -8,8 +8,10 @@ React Native 0.88, and Expo Modules 2.0 beta.
   `AbortSignal`, and reject handles from an earlier connection or session.
 - Bun canary and Nix replace the previous JavaScript tooling. One CNG Expo
   example uses Noxcturnal.
-- A TypeScript config plugin generates its JavaScript entry with Bun, keeping
-  package consumers working under both Bun and Node.
+- The config plugin ships as TypeScript with the Expo Bun loader patch used in
+  `slopper-topper`. Bun apps apply that patch in their own `patchedDependencies`;
+  there is no generated JavaScript entry or plugin build step. Packed plugin
+  loading and native modifications are verified under patched Bun and Node.
 - Review fixes preserve connection ownership on repeated connect attempts,
   isolate listener exceptions, and validate native state/log-level strings.
 

@@ -11,8 +11,8 @@
       "react-native": "./src/index.ts",
       "default": "./src/index.ts"
     },
-    "./app.plugin": "./app.plugin.js",
-    "./app.plugin.js": "./app.plugin.js",
+    "./app.plugin": "./app.plugin.ts",
+    "./app.plugin.ts": "./app.plugin.ts",
     "./package.json": "./package.json"
   },
   "files": [
@@ -26,7 +26,7 @@
     "ios",
     "expo-module.config.json",
     "app.plugin.ts",
-    "app.plugin.js"
+    "patches/@expo%2Frequire-utils@58.0.4.patch"
   ],
   "workspaces": [
     "example"
@@ -37,13 +37,12 @@
     "node": "^22.13.0 || ^24.3.0 || ^26.0.0"
   },
   "scripts": {
-    "build": "bun scripts/build.ts",
-    "prepack": "bun run build",
     "typecheck": "bun check",
     "lint": "bun lint --no-script --deny-warnings",
     "format": "bun fmt",
     "test": "bun test",
-    "verify": "bun check && bun run lint && bun fmt --check && bun test && bun run build --check",
+    "verify": "bun check && bun run lint && bun fmt --check && bun test",
+    "verify:package": "bun scripts/verify-package.ts",
     "start": "bun run --cwd example start",
     "android": "bun run --cwd example android",
     "ios": "bun run --cwd example ios",

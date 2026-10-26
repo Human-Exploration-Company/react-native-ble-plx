@@ -50,11 +50,11 @@ Expo registration over the old bridge.
 5. **One Expo integration app.** Replace both old examples with a Bun workspace Expo
    SDK 58 development-build app using CNG. Exercise permissions, state, scan,
    connect/discover/read/write/notify/disconnect and cleanup. Modernize the config
-   plugin and package exports/build output. Remove obsolete generated app native
+   plugin, package exports and packed loading. Remove obsolete generated app native
    projects, legacy tooling, obsolete CI matrices and stale setup instructions.
 6. **Behavior and distribution verification.** Use Bun tests for lifecycle races,
    cancellation, errors, event routing, notification cleanup and typed public usage.
-   Run Bun check/lint/fmt, frozen install, package build/pack inspection, Expo config,
+   Run Bun check/lint/fmt, frozen install, package packing/inspection, Expo config,
    Doctor, autolinking and iOS/Android JS exports. Build native example targets where
    the host supports them; validate minified Android release registration as well
    as debug. Clearly distinguish static/package checks from actual native builds
@@ -82,8 +82,9 @@ Expo registration over the old bridge.
   unchecked index access. SDK type generation is not authoritative: the verified
   scanner emits `unknown` for Data and non-erasable enums. Handwrite a precise native
   binding and verify native build compatibility separately.
-- Commit the Bun-built CommonJS config plugin and check freshness. Git dependencies
-  cannot depend on trusted install scripts running in the consuming app.
+- Ship the TypeScript config plugin directly and include the tracked Expo loader
+  patch from `slopper-topper`. Bun consumer apps apply it through their own
+  `patchedDependencies`; packed loading must pass under patched Bun and Node.
 - Pin the current dated Bun canary, `1.4.4-canary.20261025.1`, in Nix/package/CI.
 - Swift callback adaptation must settle once under a lock and dispatch adapter work
   onto its serial queue. Android v2 Promise already settles once; native teardown
@@ -109,7 +110,7 @@ Expo registration over the old bridge.
 Verified locally on ARM64 Linux with Bun `1.4.4-canary.20261025.1`
 (`bun --revision`: `1.4.4-canary.1+a8fcd319b`):
 
-- Locked install; strict Bun type checking, lint, formatting and plugin freshness.
+- Locked install; strict Bun type checking, lint and formatting.
 - 26 Bun tests covering session/open/close/disconnect races, abort cancellation,
   obsolete events, duplicate UUIDs, binary views, error fields and Expo plugin mods.
 - Expo Doctor: 20/20 checks pass.
@@ -127,8 +128,9 @@ Verified locally on ARM64 Linux with Bun `1.4.4-canary.20261025.1`
   Expo macro attributes removed, in Swift 5 and Swift 6 language modes. These
   checks catch syntax and engine type errors, but do **not** validate Expo macros,
   the real Apple adapter, CocoaPods or CoreBluetooth.
-- The packed archive includes native sources, TypeScript exports and the generated
-  plugin. An isolated Bun consumer installs it and loads the plugin as a function.
+- The packed archive includes native sources, TypeScript exports, `app.plugin.ts`
+  and the Expo loader patch. An isolated consumer applies the shipped patch, then
+  resolves the TypeScript plugin and applies iOS/Android mods under Bun and Node.
 
 The native shell includes build-tools 36 and 37: AGP defaults library targets to
 36, while the Expo SDK 58 app template explicitly selects 37. Both must exist in
@@ -151,10 +153,12 @@ Native state/log-level strings are checked before entering public literal unions
 Closed discovery consistently reports `SessionClosed`; native session injection
 is marked internal, and write cancellation uncertainty is documented.
 
-The config plugin remains authored in TypeScript at `app.plugin.ts`. An isolated
-packed-consumer experiment showed that SDK 58 discovers and loads that source
-under Node 24, but its unpatched loader fails under Bun's `Module._compile`.
-Therefore Bun generates the committed root `app.plugin.js` directly, replacing
-the old shim plus `plugin/build` bundle. Consumers need no local loader patch or
-trusted install scripts. Package plugin resolution and modifications are checked
-under Bun and Node; freshness remains part of `bun run verify`.
+The config plugin ships directly as `app.plugin.ts`. SDK 58 discovers and loads
+that source under Node 24; the tracked `@expo/require-utils@58.0.4` patch from
+`slopper-topper` makes its synchronous loader use native `require()` under Bun
+instead of `Module._compile`. The patch is included in the archive. Bun consumer
+apps must apply it through their own `patchedDependencies`; dependency patches do
+not propagate.
+There is no JavaScript plugin entry or plugin build step. `bun run verify:package`
+checks the actual packed TypeScript entry and native mods in an isolated patched
+consumer under Bun and Node. CI runs the same package check.

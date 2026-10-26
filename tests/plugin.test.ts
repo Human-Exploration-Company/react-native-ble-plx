@@ -3,12 +3,12 @@ import { compileModsAsync } from "@expo/config-plugins";
 import { resolveConfigPluginFunctionWithInfo } from "@expo/config-plugins/build/utils/plugin-resolver";
 import withBle from "../app.plugin.ts";
 
-test("Expo resolves the generated plugin entry without loading the radio", () => {
+test("patched Expo resolves the TypeScript plugin entry without loading the radio", () => {
   const { plugin, pluginFile } = resolveConfigPluginFunctionWithInfo(
     `${import.meta.dir}/../example`,
     "react-native-ble-plx",
   );
-  expect(pluginFile).toEndWith("/app.plugin.js");
+  expect(pluginFile).toEndWith("/app.plugin.ts");
   expect(typeof plugin).toBe("function");
   expect(plugin({ name: "BLE test", slug: "ble-test" }, {})).toMatchObject({
     name: "BLE test",
