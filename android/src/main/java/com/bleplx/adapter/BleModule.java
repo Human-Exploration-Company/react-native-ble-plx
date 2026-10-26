@@ -35,7 +35,6 @@ import com.bleplx.adapter.utils.ServiceFactory;
 import com.bleplx.adapter.utils.UUIDConverter;
 import com.bleplx.adapter.utils.mapper.RxBleDeviceToDeviceMapper;
 import com.bleplx.adapter.utils.mapper.RxScanResultToScanResultMapper;
-import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.polidea.rxandroidble2.NotificationSetupMode;
 import com.polidea.rxandroidble2.RxBleAdapterStateObservable;
 import com.polidea.rxandroidble2.RxBleClient;
@@ -53,11 +52,11 @@ import java.util.concurrent.TimeUnit;
 
 import io.reactivex.BackpressureStrategy;
 import io.reactivex.Observable;
+import io.reactivex.Scheduler;
 import io.reactivex.disposables.Disposable;
 import io.reactivex.functions.Action;
-import io.reactivex.schedulers.Schedulers;
 
-public class BleModule extends ReactContextBaseJavaModule implements BleAdapter {
+public class BleModule implements BleAdapter {
   public static final String NAME = "Ble";
 
   private final ErrorConverter errorConverter = new ErrorConverter();
@@ -68,6 +67,7 @@ public class BleModule extends ReactContextBaseJavaModule implements BleAdapter 
   private final HashMap<String, Device> discoveredDevices = new HashMap<>();
 
   private final HashMap<String, Device> connectedDevices = new HashMap<>();
+  private final HashMap<String, Object> connectionTokens = new HashMap<>();
 
   private final HashMap<String, RxBleConnection> activeConnections = new HashMap<>();
 
@@ -86,6 +86,7 @@ public class BleModule extends ReactContextBaseJavaModule implements BleAdapter 
   private final BluetoothAdapter bluetoothAdapter;
 
   private final Context context;
+  private final Scheduler callbackScheduler;
 
   @Nullable
   private Disposable scanSubscription;
@@ -101,14 +102,9 @@ public class BleModule extends ReactContextBaseJavaModule implements BleAdapter 
 
   private int currentLogLevel = RxBleLog.NONE;
 
-  @Override
-  @NonNull
-  public String getName() {
-    return NAME;
-  }
-
-  public BleModule(Context context) {
+  public BleModule(Context context, Scheduler callbackScheduler) {
     this.context = context;
+    this.callbackScheduler = callbackScheduler;
     bluetoothManager = (BluetoothManager) context.getSystemService(Context.BLUETOOTH_SERVICE);
     bluetoothAdapter = bluetoothManager.getAdapter();
   }
@@ -130,6 +126,7 @@ public class BleModule extends ReactContextBaseJavaModule implements BleAdapter 
     pendingTransactions.removeAllSubscriptions();
     connectingDevices.removeAllSubscriptions();
     connectedDevices.clear();
+    connectionTokens.clear();
     activeConnections.clear();
     discoveredDevices.clear();
 
@@ -239,7 +236,7 @@ public class BleModule extends ReactContextBaseJavaModule implements BleAdapter 
       .doOnDispose(() -> {
         safeExecutor.error(BleErrorUtils.cancelled());
         pendingTransactions.removeSubscription(transactionId);
-      }).subscribe((Action) () -> {
+      }).observeOn(callbackScheduler).subscribe((Action) () -> {
         safeExecutor.success(device);
         pendingTransactions.removeSubscription(transactionId);
       }, throwable -> {
@@ -275,6 +272,7 @@ public class BleModule extends ReactContextBaseJavaModule implements BleAdapter 
         safeExecutor.error(BleErrorUtils.cancelled());
         pendingTransactions.removeSubscription(transactionId);
       })
+      .observeOn(callbackScheduler)
       .subscribe(rssi -> {
         device.setRssi(rssi);
         safeExecutor.success(device);
@@ -312,7 +310,7 @@ public class BleModule extends ReactContextBaseJavaModule implements BleAdapter 
       .doOnDispose(() -> {
         safeExecutor.error(BleErrorUtils.cancelled());
         pendingTransactions.removeSubscription(transactionId);
-      }).subscribe(outputMtu -> {
+      }).observeOn(callbackScheduler).subscribe(outputMtu -> {
         device.setMtu(outputMtu);
         safeExecutor.success(device);
         pendingTransactions.removeSubscription(transactionId);
@@ -403,6 +401,11 @@ public class BleModule extends ReactContextBaseJavaModule implements BleAdapter 
     final RxBleDevice device = rxBleClient.getBleDevice(deviceIdentifier);
     if (device == null) {
       onErrorCallback.onError(BleErrorUtils.deviceNotFound(deviceIdentifier));
+      return;
+    }
+
+    if (connectedDevices.containsKey(deviceIdentifier)) {
+      onErrorCallback.onError(new BleError(BleErrorCode.DeviceAlreadyConnected, "Device is already connected", null));
       return;
     }
 
@@ -806,6 +809,7 @@ public class BleModule extends ReactContextBaseJavaModule implements BleAdapter 
         safeExecutor.error(BleErrorUtils.cancelled());
         pendingTransactions.removeSubscription(transactionId);
       })
+      .observeOn(callbackScheduler)
       .subscribe(bytes -> {
         descriptor.logValue("Read from", bytes);
         descriptor.setValue(bytes);
@@ -936,6 +940,7 @@ public class BleModule extends ReactContextBaseJavaModule implements BleAdapter 
         safeExecutor.error(BleErrorUtils.cancelled());
         pendingTransactions.removeSubscription(transactionId);
       })
+      .observeOn(callbackScheduler)
       .subscribe(() -> {
         descriptor.logValue("Write to", value);
         descriptor.setValue(value);
@@ -1062,6 +1067,7 @@ public class BleModule extends ReactContextBaseJavaModule implements BleAdapter 
 
     return new RxBleAdapterStateObservable(context)
       .map(this::mapRxBleAdapterStateToLocalBluetoothState)
+      .observeOn(callbackScheduler)
       .subscribe(onAdapterStateChangeCallback::onEvent);
   }
 
@@ -1101,6 +1107,7 @@ public class BleModule extends ReactContextBaseJavaModule implements BleAdapter 
         safeExecutor.error(BleErrorUtils.cancelled());
         pendingTransactions.removeSubscription(transactionId);
       })
+      .observeOn(callbackScheduler)
       .subscribe(state -> {
         safeExecutor.success(null);
         pendingTransactions.removeSubscription(transactionId);
@@ -1197,6 +1204,7 @@ public class BleModule extends ReactContextBaseJavaModule implements BleAdapter 
 
     scanSubscription = rxBleClient
       .scanBleDevices(scanSettings, filters)
+      .observeOn(callbackScheduler)
       .subscribe(scanResult -> {
         String deviceId = scanResult.getBleDevice().getMacAddress();
         if (!discoveredDevices.containsKey(deviceId)) {
@@ -1238,14 +1246,19 @@ public class BleModule extends ReactContextBaseJavaModule implements BleAdapter 
 
     final SafeExecutor<Device> safeExecutor = new SafeExecutor<>(onSuccessCallback, onErrorCallback);
 
+    final Object connectionToken = new Object();
+    connectionTokens.put(device.getMacAddress(), connectionToken);
     Observable<RxBleConnection> connect = device
       .establishConnection(autoConnect)
+      .observeOn(callbackScheduler)
       .doOnSubscribe(disposable -> onConnectionStateChangedCallback.onEvent(ConnectionState.CONNECTING))
-      .doFinally(() -> {
+      .doFinally(() -> callbackScheduler.scheduleDirect(() -> {
         safeExecutor.error(BleErrorUtils.cancelled());
+        if (connectionTokens.get(device.getMacAddress()) != connectionToken) return;
+        connectionTokens.remove(device.getMacAddress());
         onDeviceDisconnected(device);
         onConnectionStateChangedCallback.onEvent(ConnectionState.DISCONNECTED);
-      });
+      }));
 
     if (refreshGattMoment == RefreshGattMoment.ON_CONNECTED) {
       connect = connect.flatMap(rxBleConnection -> rxBleConnection
@@ -1277,7 +1290,9 @@ public class BleModule extends ReactContextBaseJavaModule implements BleAdapter 
 
 
     final Disposable subscription = connect
+      .observeOn(callbackScheduler)
       .subscribe(rxBleConnection -> {
+        if (connectionTokens.get(device.getMacAddress()) != connectionToken) return;
         Device localDevice = rxBleDeviceToDeviceMapper.map(device, rxBleConnection);
         onConnectionStateChangedCallback.onEvent(ConnectionState.CONNECTED);
         cleanServicesAndCharacteristicsForDevice(localDevice);
@@ -1287,7 +1302,7 @@ public class BleModule extends ReactContextBaseJavaModule implements BleAdapter 
       }, error -> {
         BleError bleError = errorConverter.toError(error);
         safeExecutor.error(bleError);
-        onDeviceDisconnected(device);
+        if (connectionTokens.get(device.getMacAddress()) == connectionToken) onDeviceDisconnected(device);
       });
 
     connectingDevices.replaceSubscription(device.getMacAddress(), subscription);
@@ -1321,6 +1336,7 @@ public class BleModule extends ReactContextBaseJavaModule implements BleAdapter 
         safeExecutor.error(BleErrorUtils.cancelled());
         pendingTransactions.removeSubscription(transactionId);
       })
+      .observeOn(callbackScheduler)
       .subscribe(rxBleDeviceServices -> {
         ArrayList<Service> services = new ArrayList<>();
         for (BluetoothGattService gattService : rxBleDeviceServices.getBluetoothGattServices()) {
@@ -1367,6 +1383,7 @@ public class BleModule extends ReactContextBaseJavaModule implements BleAdapter 
         safeExecutor.error(BleErrorUtils.cancelled());
         pendingTransactions.removeSubscription(transactionId);
       })
+      .observeOn(callbackScheduler)
       .subscribe(bytes -> {
         characteristic.logValue("Read from", bytes);
         characteristic.setValue(bytes);
@@ -1426,6 +1443,7 @@ public class BleModule extends ReactContextBaseJavaModule implements BleAdapter 
         safeExecutor.error(BleErrorUtils.cancelled());
         pendingTransactions.removeSubscription(transactionId);
       })
+      .observeOn(callbackScheduler)
       .subscribe(bytes -> {
         characteristic.logValue("Write to", bytes);
         characteristic.setValue(bytes);
@@ -1471,12 +1489,13 @@ public class BleModule extends ReactContextBaseJavaModule implements BleAdapter 
       })
       .flatMap(observable -> observable)
       .toFlowable(BackpressureStrategy.BUFFER)
-      .observeOn(Schedulers.computation())
+      .observeOn(callbackScheduler)
       .doOnCancel(() -> {
         safeExecutor.error(BleErrorUtils.cancelled());
         pendingTransactions.removeSubscription(transactionId);
       })
       .doOnComplete(() -> pendingTransactions.removeSubscription(transactionId))
+      .observeOn(callbackScheduler)
       .subscribe(bytes -> {
         characteristic.logValue("Notification from", bytes);
         characteristic.setValue(bytes);
@@ -1605,8 +1624,4 @@ public class BleModule extends ReactContextBaseJavaModule implements BleAdapter 
     }
   }
 
-  @Override
-  public void invalidate() {
-    clearActiveConnections();
-  }
 }

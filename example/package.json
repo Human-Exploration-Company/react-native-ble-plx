@@ -1,41 +1,21 @@
 {
-  "name": "BlePlxExample",
-  "version": "0.0.1",
+  "name": "ble-plx-example",
+  "version": "1.0.0",
   "private": true,
+  "main": "index.ts",
   "scripts": {
-    "android": "react-native run-android",
-    "ios": "react-native run-ios",
-    "start": "react-native start",
-    "pods": "pod-install --quiet"
+    "start": "bunx --bun @expo/agent-cli start --dev-client",
+    "android": "bunx --bun @expo/agent-cli dev --android",
+    "ios": "bunx --bun @expo/agent-cli dev --ios",
+    "prebuild": "bunx --bun @expo/agent-cli prebuild --no-install",
+    "doctor": "bunx --bun @expo/agent-cli doctor",
+    "export:native": "bunx --bun @expo/agent-cli export --platform ios --platform android --output-dir ../dist/native"
   },
   "dependencies": {
-    "@react-native-async-storage/async-storage": "^2.1.0",
-    "@react-navigation/native": "^7.0.14",
-    "@react-navigation/native-stack": "^7.2.0",
-    "react": "18.3.1",
-    "react-native": "0.77.0",
-    "react-native-base64": "^0.2.1",
-    "react-native-safe-area-context": "^5.1.0",
-    "react-native-screens": "^4.5.0",
-    "react-native-toast-message": "^2.1.6",
-    "styled-components": "^6.0.7"
-  },
-  "devDependencies": {
-    "@babel/core": "^7.25.2",
-    "@babel/preset-env": "^7.25.3",
-    "@babel/runtime": "^7.25.0",
-    "@react-native-community/cli": "15.0.1",
-    "@react-native-community/cli-platform-android": "15.0.1",
-    "@react-native-community/cli-platform-ios": "15.0.1",
-    "@react-native/babel-preset": "0.77.0",
-    "@react-native/eslint-config": "0.77.0",
-    "@react-native/metro-config": "0.77.0",
-    "@react-native/typescript-config": "0.77.0",
-    "@types/react-native-base64": "^0.2.0",
-    "babel-plugin-module-resolver": "^5.0.0",
-    "metro-react-native-babel-preset": "0.76.8"
-  },
-  "engines": {
-    "node": ">=18"
+    "expo": "~58.0.19",
+    "expo-dev-client": "~58.0.14",
+    "react": "19.3.0",
+    "react-native": "0.88.0",
+    "react-native-ble-plx": "workspace:*"
   }
 }

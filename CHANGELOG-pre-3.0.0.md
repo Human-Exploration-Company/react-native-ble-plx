@@ -164,7 +164,7 @@
 - Remove `--no-build` option to be able to reuse prepackages frameworks.
 - Added option to disable building dynamic frameworks with carthage
   by setting option in your app's package.json:
-  
+
   ```json
   ...
   "react-native-ble-plx": {

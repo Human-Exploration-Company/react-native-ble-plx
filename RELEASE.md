@@ -1,24 +1,23 @@
-# Release procedure
+# 4.0.0-alpha.1
 
-## 1. Local build steps
+First alpha of the Expo-first clean-break migration. Targets Expo SDK 58,
+React Native 0.88, and Expo Modules 2.0 beta.
 
-1. Commit your changes.
-2. Reinstall all dependencies `git clean -xfd && npm install`.
-    * If there are any vulnerabilities fix them with `npm audit fix`.
-    * Make sure `package-lock.json` is updated.
-3. Check for all type and documentation errors by running `npm run lint`.
-4. Run local tests via `npm test`.
-5. Bump version in `package.json` file.
-6. Add release latest release notes to `README.md` file. Append them to `CHANGELOG.md` as well.
-7. Generate new documentation via `npm run docs` and skip CSS changes.
-8. Send PR and wait for CI/CD to pass all tests successfully.
-9. Merge your changes to `master` branch.
+- Swift/Kotlin Modules 2.0 bindings replace the legacy React Native bridge.
+- Strict TypeScript sessions own BLE explicitly, use `Uint8Array` values and
+  `AbortSignal`, and reject handles from an earlier connection or session.
+- Bun canary and Nix replace the previous JavaScript tooling. One CNG Expo
+  example uses Noxcturnal.
+- A TypeScript config plugin generates its JavaScript entry with Bun, keeping
+  package consumers working under both Bun and Node.
+- Review fixes preserve connection ownership on repeated connect attempts,
+  isolate listener exceptions, and validate native state/log-level strings.
 
-## 2. Publishing
+This release breaks the previous `BleManager` API. See [README](README.md) for
+installation and usage, and [MIGRATION](MIGRATION.md) for the reviewed plan and
+validation evidence. Cancellation cannot undo a write already sent to a device.
 
-1. You can test pre-release changes in your chosen application by installing the library as
-  ```"react-native-ble-plx": "dotintent/react-native-ble-plx"```.
-2. Clean repository and publish new version: `git clean -xfd && npm publish`.
-3. Add tag to the repository in form of `x.x.x`.
-4. Add release notes to the [Github](https://github.com/dotintent/react-native-ble-plx/releases) by copying a list of changes from `CHANGELOG.md`.
-5. Check any issues which are fixed by a new version, close them and point to a new release in the comment section.
+Local checks cover strict types, lint, formatting, Bun regression tests, plugin
+packaging, Expo Doctor, native bundle exports, and Android debug/release JVM
+compilation. Xcode macro/CocoaPods builds, full Android APK/R8 builds and physical
+BLE validation remain outstanding; see [the checklist](docs/VALIDATION.md).

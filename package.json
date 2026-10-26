@@ -1,180 +1,82 @@
 {
   "name": "react-native-ble-plx",
-  "version": "3.5.1",
-  "packageManager": "yarn@1.22.22",
-  "description": "React Native Bluetooth Low Energy library",
-  "main": "src/index",
-  "module": "src/index",
-  "types": "src/index.d.ts",
-  "react-native": "src/index",
-  "source": "src/index",
+  "version": "4.0.0-alpha.1",
+  "description": "An Expo Modules 2.0 Bluetooth LE client with typed sessions and binary values",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "react-native": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "react-native": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./app.plugin": "./app.plugin.js",
+    "./app.plugin.js": "./app.plugin.js",
+    "./package.json": "./package.json"
+  },
   "files": [
+    "MIGRATION.md",
+    "RELEASE.md",
+    "docs/VALIDATION.md",
     "src",
-    "lib",
-    "android",
+    "android/src",
+    "android/build.gradle",
+    "android/proguard-rules.pro",
     "ios",
-    "cpp",
-    "plugin/build",
-    "app.plugin.js",
-    "*.podspec",
-    "!lib/typescript/example",
-    "!lib/typescript/example-expo",
-    "!ios/build",
-    "!android/build",
-    "!android/gradle",
-    "!android/gradlew",
-    "!android/gradlew.bat",
-    "!android/local.properties",
-    "!**/__tests__",
-    "!**/__fixtures__",
-    "!**/__mocks__",
-    "!**/.*"
+    "expo-module.config.json",
+    "app.plugin.ts",
+    "app.plugin.js"
   ],
+  "workspaces": [
+    "example"
+  ],
+  "packageManager": "bun@1.4.4-canary.20261025.1",
+  "engines": {
+    "bun": ">=1.4.4",
+    "node": "^22.13.0 || ^24.3.0 || ^26.0.0"
+  },
   "scripts": {
-    "build": "babel src/ -d lib/",
-    "test": "yarn test:package ; yarn test:example",
-    "test:package": "jest --config jest.config.js --passWithNoTests",
-    "test:example": "jest --config example/jest.config.js --passWithNoTests",
-    "docs": "documentation build src/index.js -o docs --config documentation.yml -f html",
-    "typecheck": "tsc --noEmit",
-    "lint": "flow && eslint \"**/*.{js,ts,tsx}\" && documentation lint index.js && yarn typecheck",
-    "prepack": "bob build",
-    "release": "release-it",
-    "example": "yarn --cwd example",
-    "build:android": "cd example/android && ./gradlew assembleDebug --no-daemon --console=plain -PreactNativeArchitectures=arm64-v8a",
-    "test:android": "cd example/android && ./gradlew assembleDebug --no-daemon --console=plain -PreactNativeArchitectures=arm64-v8a",
-    "build:ios": "cd example/ios && xcodebuild -workspace BlePlxExample.xcworkspace -scheme BlePlxExample -configuration Debug -sdk iphonesimulator CC=clang CPLUSPLUS=clang++ LD=clang LDPLUSPLUS=clang++ GCC_OPTIMIZATION_LEVEL=0 GCC_PRECOMPILE_PREFIX_HEADER=YES ASSETCATALOG_COMPILER_OPTIMIZATION=time DEBUG_INFORMATION_FORMAT=dwarf COMPILER_INDEX_STORE_ENABLE=NO",
-    "test:ios": "cd example/ios && xcodebuild -workspace BlePlxExample.xcworkspace -scheme BlePlxExample -configuration Debug -sdk iphonesimulator ASSETCATALOG_COMPILER_OPTIMIZATION=time DEBUG_INFORMATION_FORMAT=dwarf COMPILER_INDEX_STORE_ENABLE=NO",
-    "test:expo": "cd example-expo && yarn install && npx expo prebuild",
-    "bootstrap": "yarn example && yarn install && yarn example pods",
-    "clean": "del-cli android/build example/android/build example/android/app/build example/ios/build plugin/build lib",
-    "build:plugin": "tsc --build plugin",
-    "clean:plugin": "expo-module clean plugin",
-    "test:plugin": "jest --config plugin/jest.config.js",
-    "prepare": "npm run clean:plugin && npm run build:plugin",
-    "lint:plugin": "eslint plugin/src/*"
+    "build": "bun scripts/build.ts",
+    "prepack": "bun run build",
+    "typecheck": "bun check",
+    "lint": "bun lint --no-script --deny-warnings",
+    "format": "bun fmt",
+    "test": "bun test",
+    "verify": "bun check && bun run lint && bun fmt --check && bun test && bun run build --check",
+    "start": "bun run --cwd example start",
+    "android": "bun run --cwd example android",
+    "ios": "bun run --cwd example ios",
+    "doctor": "bun run --cwd example doctor",
+    "export:native": "bun run --cwd example export:native",
+    "read:search-expo-docs": "bunx --bun @expo/agent-cli docs:search --limit 5 --json --no-followups",
+    "agents:setup": "bunx --bun @expo/agent-cli agents:setup --yes --project --agent codex --no-agents-md",
+    "agents:sync": "bunx --bun @expo/agent-cli skills:sync --agent codex --agent claude-code && bunx --bun @expo/agent-cli docs:sync"
   },
-  "keywords": [
-    "react-native",
-    "ios",
-    "android",
-    "React",
-    "Native",
-    "Bluetooth",
-    "Low",
-    "Energy",
-    "BLE"
-  ],
-  "repository": "https://github.com/dotintent/react-native-ble-plx.git",
-  "author": "dotintent (https://withintent.com/)",
-  "license": "MIT",
-  "bugs": {
-    "url": "https://github.com/dotintent/react-native-ble-plx/issues"
-  },
-  "homepage": "https://github.com/dotintent/react-native-ble-plx#readme",
-  "publishConfig": {
-    "registry": "https://registry.npmjs.org/"
-  },
-  "devDependencies": {
-    "@babel/cli": "^7.25.9",
-    "@babel/core": "^7.25.2",
-    "@babel/preset-flow": "^7.25.9",
-    "@commitlint/config-conventional": "^17.0.2",
-    "@evilmartians/lefthook": "^1.5.0",
-    "@react-native-community/eslint-config": "^3.0.2",
-    "@react-native/eslint-config": "^0.73.1",
-    "@react-navigation/native": "^6.1.17",
-    "@react-navigation/native-stack": "^6.9.26",
-    "@release-it/conventional-changelog": "^5.0.0",
-    "@types/jest": "^29.5.5",
-    "@types/react": "^18.2.44",
-    "@types/react-native": "0.70.0",
-    "@types/react-native-base64": "^0.2.2",
-    "@typescript-eslint/parser": "^5.62.0",
-    "babel-plugin-syntax-hermes-parser": "^0.15.1",
-    "commitlint": "^17.0.2",
-    "del-cli": "^5.1.0",
-    "documentation": "12.3.0",
-    "eslint": "^8.51.0",
-    "eslint-config-airbnb": "^19.0.4",
-    "eslint-config-airbnb-typescript": "^17.1.0",
-    "eslint-config-prettier": "^9.0.0",
-    "eslint-plugin-flowtype": "^8.0.3",
-    "eslint-plugin-ft-flow": "^2.0.1",
-    "eslint-plugin-import": "^2.28.1",
-    "eslint-plugin-jsx-a11y": "^6.7.1",
-    "eslint-plugin-prettier": "^5.0.1",
-    "eslint-plugin-react-refresh": "^0.4.3",
-    "expo-module-scripts": "^3.1.0",
-    "flow-bin": "^0.259.1",
-    "hermes-eslint": "^0.15.1",
-    "jest": "^29.7.0",
-    "pod-install": "^0.1.0",
-    "prettier": "^3.0.3",
-    "react": "18.3.1",
-    "react-native": "0.77.0",
-    "react-native-base64": "^0.2.1",
-    "react-native-builder-bob": "^0.20.0",
-    "react-native-safe-area-context": "^4.10.5",
-    "react-native-toast-message": "^2.2.0",
-    "release-it": "^17.3.0",
-    "styled-components": "^6.1.11",
-    "turbo": "^1.10.7",
-    "typescript": "^5.2.2"
-  },
-  "resolutions": {
-    "@types/react": "^18.2.44"
+  "dependencies": {
+    "@expo/config-plugins": "~58.0.10"
   },
   "peerDependencies": {
-    "react": "*",
-    "react-native": "*"
+    "expo": "^58.0.19",
+    "react": "^19.3.0",
+    "react-native": "^0.88.0"
   },
-  "engines": {
-    "node": ">= 18.0.0"
+  "devDependencies": {
+    "@expo/agent-cli": "1.0.20",
+    "@types/bun": "^1.4.4",
+    "@types/react": "~19.3.0",
+    "expo": "~58.0.19",
+    "react": "19.3.0",
+    "react-native": "0.88.0"
   },
-  "jest": {
-    "preset": "react-native",
-    "modulePathIgnorePatterns": [
-      "<rootDir>/integration-tests",
-      "<rootDir>/example/node_modules",
-      "<rootDir>/example-expo/node_modules",
-      "<rootDir>/lib/"
-    ]
+  "repository": "https://github.com/Human-Exploration-Company/react-native-ble-plx.git",
+  "homepage": "https://github.com/Human-Exploration-Company/react-native-ble-plx#readme",
+  "bugs": {
+    "url": "https://github.com/Human-Exploration-Company/react-native-ble-plx/issues"
   },
-  "commitlint": {
-    "extends": [
-      "@commitlint/config-conventional"
-    ]
-  },
-  "release-it": {
-    "git": {
-      "commitMessage": "chore: release ${version}",
-      "tagName": "v${version}"
-    },
-    "npm": {
-      "publish": true
-    },
-    "github": {
-      "release": true
-    },
-    "plugins": {
-      "@release-it/conventional-changelog": {
-        "preset": "angular"
-      }
-    }
-  },
-  "react-native-builder-bob": {
-    "source": "src",
-    "output": "lib",
-    "targets": [
-      "commonjs",
-      "module",
-      [
-        "typescript",
-        {
-          "project": "tsconfig.build.json"
-        }
-      ]
-    ]
+  "author": "Human Exploration Company; original BLE adapters by Polidea and dotintent",
+  "license": "Apache-2.0",
+  "patchedDependencies": {
+    "@expo/require-utils@58.0.4": "patches/@expo%2Frequire-utils@58.0.4.patch"
   }
 }
