@@ -2,6 +2,24 @@
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- Android: `session.android` with `bondState`, `removeBond`, `createBond`,
+  `answerPairing` (answers the next pairing request with a known passkey),
+  and a `connectedDevice` foreground service.
+- `monitor()`'s `onReady`: after the peripheral accepted the subscription
+  (the CCCD write), on both platforms.
+- iOS: `onServicesChange()` and the `ServicesChanged` error code, from
+  CoreBluetooth's `didModifyServices`. Virtual links can indicate it
+  (`link.servicesChanged()`).
+
+### Changed
+
+- iOS: the engine uses CoreBluetooth directly; the `MultiplatformBleAdapter`
+  pod is no longer a dependency.
+
 ## [3.5.1] - 2026-02-17
 
 ### Changed

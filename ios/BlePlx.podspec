@@ -15,6 +15,6 @@ Pod::Spec.new do |s|
   s.static_framework = true
   s.source_files = '**/*.swift'
   s.dependency 'ExpoModulesCore'
-  s.dependency 'MultiplatformBleAdapter', '0.2.0'
+  s.frameworks = 'CoreBluetooth'
   s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES' }
 end

@@ -1,0 +1,15 @@
+diff --git a/build/load.js b/build/load.js
+index 0ca000700b1401782ae079ab47add678ce34325e..d6c04060fffbc0325cba7470a7377809ce27b46e 100644
+--- a/build/load.js
++++ b/build/load.js
+@@ -406,6 +406,10 @@ async function loadModule(filename) {
+  * This already forms the minimum required Node version as of Expo SDK 54 */ function loadModuleSync(filename) {
+     const format = toFormat(filename, true);
+     const isTypeScript = format.mode === 'module-typescript' || format.mode === 'commonjs-typescript' || format.mode === 'typescript';
++    // Bun loads TypeScript natively; its module._compile does not strip types.
++    if (process.isBun && isTypeScript) {
++        return require(filename);
++    }
+     try {
+         if (format.mode !== 'module' && !isTypeScript) {
+             return require(filename);

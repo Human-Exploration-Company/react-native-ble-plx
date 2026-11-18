@@ -16,10 +16,7 @@ export interface BlePluginOptions {
   readonly isBleRequired?: boolean;
 }
 
-const withBle: ConfigPlugin<BlePluginOptions | void> = (
-  config,
-  options = {},
-) => {
+const withBle: ConfigPlugin<BlePluginOptions | void> = (config, options) => {
   const props = options ?? {};
   const neverForLocation = props.neverForLocation ?? true;
   config = withInfoPlist(config, (value) => {

@@ -41,8 +41,10 @@ Expo registration over the old bridge.
 4. **Expo Modules 2.0 bindings.** Replace Objective-C and React Java module exports
    with annotated Swift and Kotlin classes (`@ExpoModule`, `@JS`, typed events and
    records). Enable the actual Android v2 compiler and Expo autolinking. Retain the
-   existing proven BLE engines (MultiplatformBleAdapter 0.2.0 on Apple and the
-   internal RxAndroidBle adapter), removing bridge-specific conversions. Serialize
+   internal RxAndroidBle adapter on Android, removing bridge-specific
+   conversions. (On Apple, MultiplatformBleAdapter 0.2.0 was retained at
+   first; the engine has since moved onto CoreBluetooth directly, for a
+   subscription's confirmation and Service Changed, which the adapter hid.) Serialize
    native state appropriately, keep blocking work off the JS thread, settle each
    operation once, cancel subscriptions/operations and clean up on module teardown.
    Do not handwrite macro/compiler-generated internals or use the old Expo DSL as
@@ -154,11 +156,12 @@ Closed discovery consistently reports `SessionClosed`; native session injection
 is marked internal, and write cancellation uncertainty is documented.
 
 The config plugin ships directly as `app.plugin.ts`. SDK 58 discovers and loads
-that source under Node 24; the tracked `@expo/require-utils@58.0.4` patch from
-`slopper-topper` makes its synchronous loader use native `require()` under Bun
-instead of `Module._compile`. The patch is included in the archive. Bun consumer
-apps must apply it through their own `patchedDependencies`; dependency patches do
-not propagate.
+that source under Node 24; the tracked `@expo/require-utils` patches (58.0.4 and
+58.0.6) use the `slopper-topper` workaround to make its synchronous loader use
+native `require()` under Bun instead of `Module._compile`. Both patches are
+included in the archive. Bun consumer apps must apply the patch matching their
+installed version through their own `patchedDependencies`; dependency patches
+do not propagate.
 There is no JavaScript plugin entry or plugin build step. `bun run verify:package`
 checks the actual packed TypeScript entry and native mods in an isolated patched
 consumer under Bun and Node. CI runs the same package check.

@@ -10,12 +10,14 @@ import type {
   NativeVoidResult,
 } from "./NativeBlePlx";
 import type {
+  AndroidBonds,
   BluetoothState,
   Characteristic,
   ConnectOptions,
   ConnectionPriority,
   Descriptor,
   Disconnection,
+  ServicesChange,
   GattReference,
   GattTree,
   LogLevel,
@@ -30,7 +32,7 @@ import type {
   WriteOptions,
 } from "./types";
 import { fullUUID } from "./uuid";
-import { bluetoothStates, logLevels } from "./types";
+import { bluetoothStates, bondStates, logLevels } from "./types";
 
 function nativeEnum<T extends string>(value: unknown, values: readonly T[]): T {
   const match = values.find((item) => item === value);
@@ -115,6 +117,9 @@ export class BleSession {
   private readonly disconnectListeners = new Set<
     (event: Disconnection) => void
   >();
+  private readonly servicesChangeListeners = new Set<
+    (event: ServicesChange) => void
+  >();
 
   private constructor(
     private readonly native: NativeBlePlx,
@@ -131,7 +136,7 @@ export class BleSession {
     this.nativeListeners.push(...listeners);
   }
 
-  private receive(event: QueuedEvent): void {
+  #receive(event: QueuedEvent): void {
     if (!this.accept(event.data.generation)) return;
     switch (event.name) {
       case "stateChange": {
@@ -141,7 +146,8 @@ export class BleSession {
           reportException(error);
           return;
         }
-        for (const listener of [...this.stateListeners])
+        // A snapshot: a listener added by a listener waits for the next event.
+        for (const listener of Array.from(this.stateListeners))
           notify(listener, this.currentState);
         break;
       }
@@ -197,8 +203,15 @@ export class BleSession {
           deviceId: data.deviceId,
           error: data.error === null ? null : new BleError(data.error),
         };
-        for (const listener of [...this.disconnectListeners])
+        for (const listener of Array.from(this.disconnectListeners))
           notify(listener, disconnection);
+        break;
+      }
+      case "servicesChange": {
+        // The native side has already ended the monitors on the changed services.
+        const change = { deviceId: event.data.deviceId };
+        for (const listener of Array.from(this.servicesChangeListeners))
+          notify(listener, change);
         break;
       }
     }
@@ -214,7 +227,7 @@ export class BleSession {
     const earlyEvents: QueuedEvent[] = [];
     const listeners: { remove(): void }[] = [];
     const receive = (event: QueuedEvent) => {
-      if (session) session.receive(event);
+      if (session) session.#receive(event);
       else earlyEvents.push(event);
     };
     try {
@@ -234,6 +247,11 @@ export class BleSession {
       listeners.push(
         native.addListener("disconnect", (data) =>
           receive({ name: "disconnect", data }),
+        ),
+      );
+      listeners.push(
+        native.addListener("servicesChange", (data) =>
+          receive({ name: "servicesChange", data }),
         ),
       );
       const result = await native.open({
@@ -260,7 +278,7 @@ export class BleSession {
         ) ?? null,
         listeners,
       );
-      for (const event of earlyEvents) session.receive(event);
+      for (const event of earlyEvents) session.#receive(event);
       earlyEvents.length = 0;
       return session;
     } catch (error) {
@@ -273,6 +291,64 @@ export class BleSession {
 
   get closed(): boolean {
     return this.isClosed;
+  }
+
+  /** Android only: the system's bonds and the foreground service. Null where the platform has none. */
+  get android(): AndroidBonds | null {
+    const n = this.native;
+    const {
+      bondState,
+      removeBond,
+      createBond,
+      answerPairing,
+      startForegroundService,
+      stopForegroundService,
+    } = n;
+    if (
+      !bondState ||
+      !removeBond ||
+      !createBond ||
+      !answerPairing ||
+      !startForegroundService ||
+      !stopForegroundService
+    )
+      return null;
+    const g = this.generation;
+    return {
+      bondState: (id) =>
+        this.operation(() =>
+          bondState
+            .call(n, g, id)
+            .then((r) => nativeEnum(this.value(r), bondStates)),
+        ),
+      removeBond: (id) =>
+        this.operation(() =>
+          removeBond.call(n, g, id).then((r) => this.value(r)),
+        ),
+      createBond: (id) =>
+        this.operation(() =>
+          createBond.call(n, g, id).then((r) => this.value(r)),
+        ),
+      answerPairing: (id, passkey, options = {}) => {
+        if (!/^\d{6}$/.test(passkey))
+          return Promise.reject(new BleError("InvalidArgument"));
+        return this.operation(() =>
+          answerPairing
+            .call(n, g, id, passkey, options.timeoutMs ?? 30_000)
+            .then((r) => this.check(r)),
+        );
+      },
+      startForegroundService: ({ title, text }) =>
+        this.operation(() =>
+          startForegroundService
+            .call(n, g, title, text)
+            .then((r) => this.check(r)),
+        ),
+      stopForegroundService: () =>
+        this.operation(() =>
+          stopForegroundService.call(n, g).then((r) => this.check(r)),
+        ),
+    };
   }
 
   close(): Promise<void> {
@@ -320,6 +396,20 @@ export class BleSession {
     this.disconnectListeners.add(listener);
     return this.subscription(() => {
       this.disconnectListeners.delete(listener);
+    });
+  }
+
+  /**
+   * A connected peripheral's Service Changed. Its handles under the changed
+   * services are gone, and monitors on them have ended with `ServicesChanged`:
+   * discover the device again. iOS and virtual peripherals; Android's engine
+   * (RxAndroidBle) does not surface it.
+   */
+  onServicesChange(listener: (event: ServicesChange) => void): Subscription {
+    this.assertOpen();
+    this.servicesChangeListeners.add(listener);
+    return this.subscription(() => {
+      this.servicesChangeListeners.delete(listener);
     });
   }
 
@@ -598,6 +688,8 @@ export class BleSession {
       )
       .then((result) => {
         this.check(result);
+        if (!subscription.closed && options.onReady)
+          notify(options.onReady, undefined);
       })
       .catch((error) => {
         if (subscription.closed) return;

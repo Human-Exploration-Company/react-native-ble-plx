@@ -112,9 +112,49 @@ export interface Disconnection {
   readonly deviceId: string;
   readonly error: BleError | null;
 }
+/** A connected peripheral's services changed: discover it again before using its handles. */
+export interface ServicesChange {
+  readonly deviceId: string;
+}
 export interface WriteOptions extends OperationOptions {
   readonly withResponse?: boolean;
 }
 export interface MonitorOptions extends OperationOptions {
   readonly androidSubscriptionType?: "notification" | "indication";
+  /**
+   * Called once the subscription is in place. Android: once the peripheral
+   * has accepted it (its CCCD write succeeded). iOS: once requested, since
+   * CoreBluetooth reports only a refusal, which arrives as an error.
+   */
+  readonly onReady?: () => void;
+}
+
+export const bondStates = ["none", "bonding", "bonded"] as const;
+export type BondState = (typeof bondStates)[number];
+
+/** Android only: what the system holds of a device beyond its GATT. */
+export interface AndroidBonds {
+  bondState(deviceId: string): Promise<BondState>;
+  /** Removes the system's bond: a hidden platform method, so it may be refused (false). */
+  removeBond(deviceId: string): Promise<boolean>;
+  /** Starts pairing at the system's level. */
+  createBond(deviceId: string): Promise<boolean>;
+  /**
+   * Answers the device's pairing requests with a passkey of six digits, so
+   * the system shows no dialog, until the pairing ends or `timeoutMs` (30 s
+   * by default) passes. Resolves once armed. It does not start pairing: a
+   * protected operation, or {@link createBond}, does; follow it with
+   * {@link bondState}, or the operation's own result.
+   */
+  answerPairing(
+    deviceId: string,
+    passkey: string,
+    options?: { readonly timeoutMs?: number },
+  ): Promise<void>;
+  /** A foreground service of type `connectedDevice`, so links survive in the background. */
+  startForegroundService(notification: {
+    readonly title: string;
+    readonly text: string;
+  }): Promise<void>;
+  stopForegroundService(): Promise<void>;
 }

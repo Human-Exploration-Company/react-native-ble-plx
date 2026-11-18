@@ -38,6 +38,7 @@ export const bleErrorCodes = [
   "DescriptorWriteNotAllowed",
   "ScanStartFailed",
   "LocationServicesDisabled",
+  "ServicesChanged",
   "SessionClosed",
   "SessionAlreadyOpen",
   "StaleHandle",

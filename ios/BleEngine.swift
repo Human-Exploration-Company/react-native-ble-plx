@@ -1,23 +1,27 @@
+import CoreBluetooth
 import Foundation
-@preconcurrency import MultiplatformBleAdapter
 import os
 
+// The Apple engine, on CoreBluetooth directly.
+//
 // Threading model
 //
 // Every piece of mutable state below is confined to `BleEngine.queue`, which is also the queue the
-// adapter and its CBCentralManager run on, so adapter callbacks and delegate events arrive on it.
-// `@JS` methods start on the JavaScript thread, dispatch onto the queue and suspend on a
-// continuation. `JavaScriptActor` does not hop threads, so after the continuation resumes, the
-// generated binding keeps running on this queue until it encodes the result on the JavaScript
-// thread; no code here touches state after resuming.
+// CBCentralManager delivers its delegate calls on. `@JS` methods start on the JavaScript thread,
+// dispatch onto the queue and suspend on a continuation; no code touches state after resuming.
 //
 // Identity
 //
 // Each session has a generation. Requests carry the generation they were issued for; events and
-// results carry the session's. Adapter transaction ids are minted per request ("t<gen>.<serial>",
-// "m<gen>.<serial>"), so a reused public id can never reach the adapter or settle a newer request.
-// Each connection attempt has a token; a callback or disconnection from an attempt that is no longer
-// current is dropped.
+// results carry the session's. Each connection attempt has a token; a callback from an attempt that
+// is no longer current is dropped. GATT objects get numeric handles when discovered; a handle dies
+// with its connection, a new discovery, or the service it belongs to changing.
+//
+// Ordering
+//
+// CoreBluetooth answers a peripheral's requests of one kind on one attribute in the order they were
+// made, so each attribute keeps a FIFO of its waiting requests. A request cancelled from JavaScript
+// stays in its FIFO until CoreBluetooth answers it, so later answers still reach later requests.
 
 // MARK: - Settle once
 
@@ -49,19 +53,18 @@ final class Once<R: Sendable>: @unchecked Sendable {
 protocol PendingEntry: AnyObject {
   var id: UInt64 { get }
   var publicTransaction: String? { get }
-  var adapterTransaction: String? { get }
+  var settled: Bool { get }
   func fail(_ error: BleErrorRecord)
 }
 
-/// One in-flight request. Settling removes it from its session's registry, so a late adapter
-/// callback finds nothing to settle.
+/// One in-flight request. Settling removes it from its session's registry.
 final class Pending<R: BleResult>: PendingEntry, @unchecked Sendable {
   let id: UInt64
   let generation: Int
   private let once: Once<R>
   private weak var session: Session?
   var publicTransaction: String?
-  var adapterTransaction: String?
+  private(set) var settled = false
 
   init(id: UInt64, generation: Int, once: Once<R>, session: Session) {
     self.id = id
@@ -71,13 +74,37 @@ final class Pending<R: BleResult>: PendingEntry, @unchecked Sendable {
   }
 
   func succeed(_ result: R) {
+    guard !settled else { return }
+    settled = true
     session?.unregister(self)
     once.resume(result)
   }
 
   func fail(_ error: BleErrorRecord) {
+    guard !settled else { return }
+    settled = true
     session?.unregister(self)
     once.resume(R.failure(generation, error))
+  }
+}
+
+/// A FIFO of requests waiting on one attribute's answers.
+struct Waiters<R: BleResult> {
+  private var items: [Pending<R>] = []
+
+  var isEmpty: Bool { items.isEmpty }
+
+  mutating func append(_ entry: Pending<R>) { items.append(entry) }
+
+  /// The oldest request, settled or not: CoreBluetooth's answer belongs to it.
+  mutating func pop() -> Pending<R>? {
+    items.isEmpty ? nil : items.removeFirst()
+  }
+
+  mutating func failAll(_ error: BleErrorRecord) {
+    let all = items
+    items.removeAll()
+    all.forEach { $0.fail(error) }
   }
 }
 
@@ -92,11 +119,62 @@ struct Connection {
 
   let token: UInt64
   var phase: Phase
+  var connect: Pending<PeripheralResultRecord>?
+  var cancels: [Pending<PeripheralResultRecord>] = []
+  var timeout: DispatchWorkItem?
 }
 
 struct Monitor {
-  let adapterTransaction: String
-  let deviceId: String?
+  let deviceId: String
+  let characteristic: Double
+}
+
+enum Attribute {
+  case service(deviceId: String, service: CBService)
+  case characteristic(deviceId: String, characteristic: CBCharacteristic, service: Double)
+  case descriptor(deviceId: String, descriptor: CBDescriptor, characteristic: Double, service: Double)
+
+  var deviceId: String {
+    switch self {
+    case let .service(deviceId, _), let .characteristic(deviceId, _, _), let .descriptor(deviceId, _, _, _):
+      return deviceId
+    }
+  }
+}
+
+/// A discovery in progress: services, then each service's characteristics, then each one's descriptors.
+struct Discovery {
+  let pending: Pending<GattTreeResultRecord>
+  var outstanding = 0
+}
+
+/// Requests waiting on one peripheral's answers.
+struct PeripheralWaiters {
+  var reads: [ObjectIdentifier: Waiters<BytesResultRecord>] = [:]
+  var writes: [ObjectIdentifier: Waiters<VoidResultRecord>] = [:]
+  var notifies: [ObjectIdentifier: Waiters<VoidResultRecord>] = [:]
+  var descriptorReads: [ObjectIdentifier: Waiters<BytesResultRecord>] = [:]
+  var descriptorWrites: [ObjectIdentifier: Waiters<VoidResultRecord>] = [:]
+  var rssi = Waiters<PeripheralResultRecord>()
+  /// Writes without response waiting for room in CoreBluetooth's queue.
+  var unsent: [(pending: Pending<VoidResultRecord>, characteristic: CBCharacteristic, value: Data)] = []
+  var discovery: Discovery?
+
+  mutating func failAll(_ error: BleErrorRecord) {
+    for key in reads.keys { reads[key]?.failAll(error) }
+    for key in writes.keys { writes[key]?.failAll(error) }
+    for key in notifies.keys { notifies[key]?.failAll(error) }
+    for key in descriptorReads.keys { descriptorReads[key]?.failAll(error) }
+    for key in descriptorWrites.keys { descriptorWrites[key]?.failAll(error) }
+    rssi.failAll(error)
+    let waiting = unsent
+    unsent.removeAll()
+    waiting.forEach { $0.pending.fail(error) }
+    if let discovery {
+      self.discovery = nil
+      discovery.pending.fail(error)
+    }
+  }
 }
 
 final class OpenWaiter {
@@ -106,25 +184,29 @@ final class OpenWaiter {
 
 final class Session: @unchecked Sendable {
   let generation: Int
-  let adapter: BleAdapter
-  let delegate: AdapterDelegate
+  let central: CBCentralManager
+  let delegate: CentralDelegate
 
   var pending: [UInt64: PendingEntry] = [:]
   /// Public transaction id to the pending request currently using it.
   var transactions: [String: UInt64] = [:]
+  var peripherals: [String: CBPeripheral] = [:]
   var connections: [String: Connection] = [:]
-  /// Public subscription id to its monitor, and the adapter transaction back to the subscription id.
+  var waiters: [String: PeripheralWaiters] = [:]
   var monitors: [String: Monitor] = [:]
-  var monitorTransactions: [String: String] = [:]
-  /// Characteristic handle to device id, learned from discovery, so monitors end with their device.
-  var handleDevices: [Double: String] = [:]
+  var attributes: [Double: Attribute] = [:]
+  var handles: [ObjectIdentifier: Double] = [:]
+  /// The last advertisement seen of each peripheral, for its snapshots.
+  var advertised: [String: PeripheralRecord] = [:]
   var scanId: String?
   var openWaiter: OpenWaiter?
+  var logLevel = "None"
   private var serial: UInt64 = 0
+  private var lastHandle: Double = 0
 
-  init(generation: Int, adapter: BleAdapter, delegate: AdapterDelegate) {
+  init(generation: Int, central: CBCentralManager, delegate: CentralDelegate) {
     self.generation = generation
-    self.adapter = adapter
+    self.central = central
     self.delegate = delegate
   }
 
@@ -133,26 +215,24 @@ final class Session: @unchecked Sendable {
     return serial
   }
 
+  func nextHandle() -> Double {
+    lastHandle += 1
+    return lastHandle
+  }
+
   func register<R: BleResult>(_ once: Once<R>) -> Pending<R> {
     let entry = Pending(id: nextSerial(), generation: generation, once: once, session: self)
     pending[entry.id] = entry
     return entry
   }
 
-  /// Binds a public transaction id to `entry` and returns the adapter transaction id to use. A
-  /// request still holding the same public id is cancelled first.
-  func begin<R: BleResult>(_ entry: Pending<R>, _ publicTransaction: String) -> String {
+  /// Binds a public transaction id to `entry`; a request still holding the same id is cancelled.
+  func begin<R: BleResult>(_ entry: Pending<R>, _ publicTransaction: String) {
     if let previous = transactions[publicTransaction], let stale = pending[previous] {
       stale.fail(.make("OperationCancelled"))
-      if let adapterTransaction = stale.adapterTransaction {
-        adapter.cancelTransaction(adapterTransaction)
-      }
     }
-    let adapterTransaction = "t\(generation).\(nextSerial())"
     entry.publicTransaction = publicTransaction
-    entry.adapterTransaction = adapterTransaction
     transactions[publicTransaction] = entry.id
-    return adapterTransaction
   }
 
   func unregister(_ entry: PendingEntry) {
@@ -165,30 +245,134 @@ final class Session: @unchecked Sendable {
     }
   }
 
-  func removeMonitor(_ subscriptionId: String) -> Monitor? {
-    guard let monitor = monitors.removeValue(forKey: subscriptionId) else {
-      return nil
+  func handle(of object: AnyObject) -> Double? {
+    handles[ObjectIdentifier(object)]
+  }
+
+  func assign(_ object: AnyObject, _ attribute: Attribute) -> Double {
+    if let existing = handles[ObjectIdentifier(object)] {
+      attributes[existing] = attribute
+      return existing
     }
-    monitorTransactions[monitor.adapterTransaction] = nil
-    return monitor
+    let handle = nextHandle()
+    handles[ObjectIdentifier(object)] = handle
+    attributes[handle] = attribute
+    return handle
+  }
+
+  /// Forgets the handles of `deviceId`, or only those under `services`.
+  func forget(_ deviceId: String, services: Set<ObjectIdentifier>? = nil) -> [Double] {
+    var dropped: [Double] = []
+    for (handle, attribute) in attributes where attribute.deviceId == deviceId {
+      let owner: CBService?
+      switch attribute {
+      case let .service(_, service): owner = service
+      case let .characteristic(_, characteristic, _): owner = characteristic.service
+      case let .descriptor(_, descriptor, _, _): owner = descriptor.characteristic?.service
+      }
+      if let services, !(owner.map { services.contains(ObjectIdentifier($0)) } ?? true) {
+        continue
+      }
+      dropped.append(handle)
+    }
+    for handle in dropped {
+      attributes[handle] = nil
+    }
+    handles = handles.filter { !dropped.contains($0.value) }
+    return dropped
   }
 }
 
 // MARK: - Delegate and event sink
 
-/// The adapter retains its delegate strongly, so this NSObject holds the engine weakly and stamps
-/// events with the generation of the adapter that produced them.
-final class AdapterDelegate: NSObject, BleClientManagerDelegate {
+/// CoreBluetooth retains its delegates weakly; the session holds this one and it holds the engine
+/// weakly, stamping events with the generation of the central that produced them.
+final class CentralDelegate: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
   private weak var engine: BleEngine?
-  private let generation: Int
+  let generation: Int
 
   init(engine: BleEngine, generation: Int) {
     self.engine = engine
     self.generation = generation
   }
 
-  func dispatchEvent(_ name: String, value: Any) {
-    engine?.adapterEvent(generation: generation, name: name, value: value)
+  private func on(_ body: (BleEngine, Session) -> Void) {
+    guard let engine, let session = engine.current(generation) else { return }
+    body(engine, session)
+  }
+
+  func centralManagerDidUpdateState(_ central: CBCentralManager) {
+    on { $0.stateChanged($1) }
+  }
+
+  func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
+    let restored = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] ?? []
+    on { $0.restored($1, restored) }
+  }
+
+  func centralManager(
+    _ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
+    advertisementData: [String: Any], rssi RSSI: NSNumber
+  ) {
+    on { $0.discovered($1, peripheral, advertisementData, RSSI) }
+  }
+
+  func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+    on { $0.didConnect($1, peripheral) }
+  }
+
+  func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+    on { $0.didFailToConnect($1, peripheral, error) }
+  }
+
+  func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+    on { $0.didDisconnect($1, peripheral, error) }
+  }
+
+  func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+    on { $0.didDiscoverServices($1, peripheral, error) }
+  }
+
+  func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+    on { $0.didDiscoverCharacteristics($1, peripheral, service, error) }
+  }
+
+  func peripheral(_ peripheral: CBPeripheral, didDiscoverDescriptorsFor characteristic: CBCharacteristic, error: Error?) {
+    on { $0.didDiscoverDescriptors($1, peripheral, error) }
+  }
+
+  func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+    on { $0.didUpdateValue($1, peripheral, characteristic, error) }
+  }
+
+  func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+    on { $0.didWrite($1, peripheral, characteristic, error) }
+  }
+
+  func peripheral(
+    _ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?
+  ) {
+    on { $0.didUpdateNotificationState($1, peripheral, characteristic, error) }
+  }
+
+  func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor descriptor: CBDescriptor, error: Error?) {
+    on { $0.didReadDescriptor($1, peripheral, descriptor, error) }
+  }
+
+  func peripheral(_ peripheral: CBPeripheral, didWriteValueFor descriptor: CBDescriptor, error: Error?) {
+    on { $0.didWriteDescriptor($1, peripheral, descriptor, error) }
+  }
+
+  func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
+    on { $0.didReadRSSI($1, peripheral, RSSI, error) }
+  }
+
+  func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+    on { $0.readyToWrite($1, peripheral) }
+  }
+
+  func peripheral(_ peripheral: CBPeripheral, didModifyServices invalidatedServices: [CBService]) {
+    on { $0.servicesChanged($1, peripheral, invalidatedServices) }
   }
 }
 
@@ -197,6 +381,7 @@ protocol BleEventSink: AnyObject {
   func emit(scan event: ScanEventRecord)
   func emit(notification event: NotificationEventRecord)
   func emit(disconnect event: DisconnectEventRecord)
+  func emit(servicesChange event: ServicesChangeEventRecord)
 }
 
 private final class SinkBox: @unchecked Sendable {
@@ -209,42 +394,30 @@ private final class SinkBox: @unchecked Sendable {
   }
 }
 
-/// Carries a closure onto the serial queue that confines all of its state.
-private struct QueueConfined: @unchecked Sendable {
-  let body: () -> Void
-  init(_ body: @escaping () -> Void) { self.body = body }
-}
-
 // MARK: - Engine
 
 final class BleEngine: @unchecked Sendable {
-  private static let queueKey = DispatchSpecificKey<Void>()
-
   private let queue: DispatchQueue
   private let sinkBox = SinkBox()
   private var session: Session?
   private var lastGeneration = 0
   private var lastConnectionToken: UInt64 = 0
+  private let log = Logger(subsystem: "com.bleplx", category: "engine")
 
   init() {
     queue = DispatchQueue(label: "com.bleplx.adapter", qos: .userInitiated)
-    queue.setSpecific(key: Self.queueKey, value: ())
   }
 
   func attach(_ sink: BleEventSink) {
     sinkBox.sink = sink
   }
 
-  /// Runs `body` on the queue: inline when already there, as adapter callbacks normally are.
-  private func confined(_ body: @escaping () -> Void) {
-    if DispatchQueue.getSpecific(key: Self.queueKey) != nil {
-      body()
-    } else {
-      // The closure only ever runs on this queue, which confines everything it touches.
-      let confinedBody = QueueConfined(body)
-      queue.async { confinedBody.body() }
-    }
+  fileprivate func current(_ generation: Int) -> Session? {
+    guard let session, session.generation == generation else { return nil }
+    return session
   }
+
+  private var sink: BleEventSink? { sinkBox.sink }
 
   /// Registers a request for `generation` on the queue and suspends until it settles.
   private func run<R: BleResult>(
@@ -264,10 +437,35 @@ final class BleEngine: @unchecked Sendable {
     }
   }
 
-  private func reject<R: BleResult>(_ pending: Pending<R>) -> Reject {
-    { [weak self] _, message, _ in
-      self?.confined { pending.fail(BleConversions.error(message)) }
+  /// Runs a GATT request on a connected peripheral, or fails it as the radio's state requires.
+  private func onPeripheral<R: BleResult>(
+    _ session: Session, _ pending: Pending<R>, _ deviceId: String, _ body: (CBPeripheral) -> Void
+  ) {
+    if let unavailable = BleConversions.unavailable(session.central.state) {
+      pending.fail(unavailable)
+      return
     }
+    guard let peripheral = session.peripherals[deviceId], peripheral.state == .connected,
+      session.connections[deviceId]?.phase == .connected
+    else {
+      pending.fail(.make("DeviceNotConnected", deviceId: deviceId))
+      return
+    }
+    body(peripheral)
+  }
+
+  private func characteristicAt(_ session: Session, _ handle: Double) -> (String, CBCharacteristic)? {
+    if case let .characteristic(deviceId, characteristic, _) = session.attributes[handle] {
+      return (deviceId, characteristic)
+    }
+    return nil
+  }
+
+  private func descriptorAt(_ session: Session, _ handle: Double) -> (String, CBDescriptor)? {
+    if case let .descriptor(deviceId, descriptor, _, _) = session.attributes[handle] {
+      return (deviceId, descriptor)
+    }
+    return nil
   }
 
   // MARK: Lifecycle
@@ -282,22 +480,25 @@ final class BleEngine: @unchecked Sendable {
         }
         lastGeneration += 1
         let generation = lastGeneration
-        let delegate = AdapterDelegate(engine: self, generation: generation)
-        let adapter = BleAdapterFactory.getNewAdapterWithQueue(queue, restoreIdentifierKey: options.restoreIdentifier)
-        let session = Session(generation: generation, adapter: adapter, delegate: delegate)
+        let delegate = CentralDelegate(engine: self, generation: generation)
+        var managerOptions: [String: Any] = [CBCentralManagerOptionShowPowerAlertKey: false]
+        if let restore = options.restoreIdentifier {
+          managerOptions[CBCentralManagerOptionRestoreIdentifierKey] = restore
+        }
+        // The delegate is given at creation: with a restore identifier, CoreBluetooth throws
+        // unless it implements willRestoreState. Its calls come on this queue, so none reaches
+        // the delegate before this block has set the session up.
+        let central = CBCentralManager(delegate: delegate, queue: queue, options: managerOptions)
+        let session = Session(generation: generation, central: central, delegate: delegate)
+        session.logLevel = options.logLevel
         self.session = session
-        adapter.setLogLevel(options.logLevel)
-        adapter.delegate = delegate
-
         guard options.restoreIdentifier != nil else {
-          once.resume(.success(generation, OpenInfoRecord(state: currentState(session), restored: nil)))
+          once.resume(.success(generation, OpenInfoRecord(state: BleConversions.state(central.state), restored: nil)))
           return
         }
-        // The adapter reports restoration, or its absence, exactly once: on willRestoreState or on
-        // the first didUpdateState, which CoreBluetooth always delivers after creating the manager
-        // (MultiplatformBleAdapter 0.2.0: amb(rx_state.skip(1), listenOnRestoredState()).take(1)).
-        // Hold the result until then so restored peripherals reach JavaScript with the session.
-        // Only teardown settles the waiter otherwise.
+        // With restoration, CoreBluetooth calls willRestoreState before the first state update when
+        // it relaunched the app for this manager; otherwise the first state update comes alone.
+        // Hold the result until one of them so restored peripherals reach JavaScript with it.
         session.openWaiter = OpenWaiter(once)
       }
     }
@@ -335,17 +536,60 @@ final class BleEngine: @unchecked Sendable {
       session.openWaiter = nil
       waiter.once.resume(.failure(session.generation, .sessionClosed))
     }
-    // Settle first: invalidation disposes adapter transactions, whose callbacks then find nothing.
+    for deviceId in Array(session.waiters.keys) {
+      session.waiters[deviceId]?.failAll(.sessionClosed)
+    }
     for entry in Array(session.pending.values) {
       entry.fail(.sessionClosed)
     }
-    session.monitors.removeAll()
-    session.monitorTransactions.removeAll()
+    if session.scanId != nil, session.central.state == .poweredOn {
+      session.central.stopScan()
+    }
+    for (deviceId, connection) in session.connections {
+      connection.timeout?.cancel()
+      if let peripheral = session.peripherals[deviceId] {
+        session.central.cancelPeripheralConnection(peripheral)
+      }
+    }
     session.connections.removeAll()
-    session.handleDevices.removeAll()
+    session.monitors.removeAll()
+    session.attributes.removeAll()
+    session.handles.removeAll()
     session.scanId = nil
-    session.adapter.invalidate()
-    session.adapter.delegate = nil
+    for peripheral in session.peripherals.values where peripheral.delegate === session.delegate {
+      peripheral.delegate = nil
+    }
+    session.central.delegate = nil
+  }
+
+  fileprivate func stateChanged(_ session: Session) {
+    let state = BleConversions.state(session.central.state)
+    if session.openWaiter != nil {
+      finishOpen(session, restored: nil)
+    }
+    if session.central.state != .poweredOn {
+      // CoreBluetooth ends every link and scan when the radio goes; report them as ended.
+      session.scanId = nil
+      let unavailable = BleConversions.unavailable(session.central.state) ?? .make("BluetoothPoweredOff")
+      for deviceId in Array(session.connections.keys) {
+        endConnection(session, deviceId, error: unavailable)
+      }
+    }
+    sink?.emit(stateChange: StateChangeEventRecord(generation: session.generation, state: state))
+  }
+
+  fileprivate func restored(_ session: Session, _ peripherals: [CBPeripheral]) {
+    var connected: [PeripheralRecord] = []
+    for peripheral in peripherals {
+      let id = peripheral.identifier.uuidString
+      session.peripherals[id] = peripheral
+      peripheral.delegate = session.delegate
+      if peripheral.state == .connected {
+        session.connections[id] = Connection(token: nextConnectionToken(), phase: .connected)
+        connected.append(record(session, peripheral))
+      }
+    }
+    finishOpen(session, restored: connected)
   }
 
   private func finishOpen(_ session: Session, restored: [PeripheralRecord]?) {
@@ -353,18 +597,10 @@ final class BleEngine: @unchecked Sendable {
       return
     }
     session.openWaiter = nil
-    for device in restored ?? [] {
-      session.connections[device.id] = Connection(token: nextConnectionToken(), phase: .connected)
-    }
-    waiter.once.resume(.success(session.generation, OpenInfoRecord(state: currentState(session), restored: restored)))
-  }
-
-  private func currentState(_ session: Session) -> String {
-    var state = "Unknown"
-    session.adapter.state({ value in
-      state = BleConversions.string(value) ?? "Unknown"
-    }, reject: { _, _, _ in })
-    return state
+    waiter.once.resume(.success(
+      session.generation,
+      OpenInfoRecord(state: BleConversions.state(session.central.state), restored: restored)
+    ))
   }
 
   private func nextConnectionToken() -> UInt64 {
@@ -372,41 +608,71 @@ final class BleEngine: @unchecked Sendable {
     return lastConnectionToken
   }
 
+  /// A snapshot of a peripheral: what it last advertised, its name and the payload it takes now.
+  private func record(_ session: Session, _ peripheral: CBPeripheral, rssi: Int? = nil) -> PeripheralRecord {
+    let id = peripheral.identifier.uuidString
+    var snapshot = session.advertised[id] ?? BleConversions.minimalPeripheral(id)
+    snapshot.name = peripheral.name ?? snapshot.name
+    if let rssi {
+      snapshot.rssi = rssi
+    }
+    snapshot.mtu = peripheral.state == .connected
+      ? peripheral.maximumWriteValueLength(for: .withoutResponse) + 3
+      : 23
+    return snapshot
+  }
+
   // MARK: State and logging
 
   func state(_ generation: Int) async -> StateResultRecord {
-    await run(generation, StateResultRecord.self) { [self] session, pending in
-      pending.succeed(.success(generation, currentState(session)))
+    await run(generation, StateResultRecord.self) { session, pending in
+      pending.succeed(.success(generation, BleConversions.state(session.central.state)))
     }
   }
 
   func setLogLevel(_ generation: Int, _ level: String) async -> VoidResultRecord {
     await run(generation, VoidResultRecord.self) { session, pending in
-      session.adapter.setLogLevel(level)
+      session.logLevel = level
       pending.succeed(.ok(generation))
     }
   }
 
   func logLevel(_ generation: Int) async -> LogLevelResultRecord {
-    await run(generation, LogLevelResultRecord.self) { [self] session, pending in
-      session.adapter.logLevel({ value in
-        pending.succeed(.success(generation, BleConversions.string(value) ?? "None"))
-      }, reject: reject(pending))
+    await run(generation, LogLevelResultRecord.self) { session, pending in
+      pending.succeed(.success(generation, session.logLevel))
     }
   }
 
   // MARK: Scanning
 
   func startScan(_ generation: Int, _ scanId: String, _ options: ScanOptionsRecord) async -> VoidResultRecord {
-    await run(generation, VoidResultRecord.self) { session, pending in
-      if session.scanId != nil {
-        session.adapter.stopDeviceScan()
+    await run(generation, VoidResultRecord.self) { [self] session, pending in
+      let fail = { (error: BleErrorRecord) in
+        // A scan that cannot start reports so as its first event, as one that fails later does.
+        session.scanId = nil
+        self.sink?.emit(scan: ScanEventRecord(generation: generation, scanId: scanId, device: nil, error: error))
       }
-      // Set before starting: an invalid filter is reported synchronously as a scan event.
+      if session.scanId != nil, session.central.state == .poweredOn {
+        session.central.stopScan()
+      }
       session.scanId = scanId
-      let scanOptions: [String: AnyObject] = ["allowDuplicates": NSNumber(value: options.allowDuplicates)]
-      session.adapter.startDeviceScan(options.services, options: scanOptions)
       pending.succeed(.ok(generation))
+      if let unavailable = BleConversions.unavailable(session.central.state) {
+        fail(unavailable)
+        return
+      }
+      var services: [CBUUID]?
+      if let uuids = options.services {
+        guard uuids.allSatisfy(BleConversions.isUUID) else {
+          fail(.make("InvalidIdentifiers", reason: "Not a UUID: \(uuids.joined(separator: ", "))"))
+          return
+        }
+        services = uuids.map { CBUUID(string: $0) }
+      }
+      session.central.scanForPeripherals(
+        withServices: services,
+        options: [CBCentralManagerScanOptionAllowDuplicatesKey: options.allowDuplicates]
+      )
     }
   }
 
@@ -414,10 +680,23 @@ final class BleEngine: @unchecked Sendable {
     await run(generation, VoidResultRecord.self) { session, pending in
       if session.scanId == scanId {
         session.scanId = nil
-        session.adapter.stopDeviceScan()
+        if session.central.state == .poweredOn {
+          session.central.stopScan()
+        }
       }
       pending.succeed(.ok(generation))
     }
+  }
+
+  fileprivate func discovered(
+    _ session: Session, _ peripheral: CBPeripheral, _ advertisement: [String: Any], _ rssi: NSNumber
+  ) {
+    let id = peripheral.identifier.uuidString
+    session.peripherals[id] = peripheral
+    let snapshot = BleConversions.advertised(id, peripheral.name, advertisement, rssi.intValue)
+    session.advertised[id] = snapshot
+    guard let scanId = session.scanId else { return }
+    sink?.emit(scan: ScanEventRecord(generation: session.generation, scanId: scanId, device: snapshot, error: nil))
   }
 
   // MARK: Connections
@@ -432,120 +711,172 @@ final class BleEngine: @unchecked Sendable {
         )
         return
       }
-      let token = nextConnectionToken()
-      session.connections[deviceId] = Connection(token: token, phase: .connecting)
-      var connectOptions: [String: AnyObject] = [:]
-      if let timeout = options.timeoutMs {
-        connectOptions["timeout"] = NSNumber(value: timeout)
+      if let unavailable = BleConversions.unavailable(session.central.state) {
+        pending.fail(unavailable)
+        return
       }
-      session.adapter.connectToDevice(
-        deviceId,
-        options: connectOptions,
-        resolve: { [weak self, weak session] value in
-          self?.confined {
-            guard let session, session.connections[deviceId]?.token == token else {
-              pending.fail(.make("OperationCancelled", deviceId: deviceId))
-              return
-            }
-            session.connections[deviceId]?.phase = .connected
-            pending.succeed(.success(generation, BleConversions.peripheral(value) ?? BleConversions.minimalPeripheral(deviceId)))
-          }
-        },
-        reject: { [weak self, weak session] _, message, _ in
-          self?.confined {
-            if let session, session.connections[deviceId]?.token == token {
-              session.connections[deviceId] = nil
-            }
-            pending.fail(BleConversions.error(message))
-          }
+      guard let peripheral = peripheral(session, deviceId) else {
+        pending.fail(.make("DeviceNotFound", deviceId: deviceId))
+        return
+      }
+      let token = nextConnectionToken()
+      var connection = Connection(token: token, phase: .connecting, connect: pending)
+      if let timeoutMs = options.timeoutMs {
+        let timeout = DispatchWorkItem { [weak self, weak session] in
+          guard let self, let session, session.connections[deviceId]?.token == token,
+            session.connections[deviceId]?.phase == .connecting
+          else { return }
+          session.connections[deviceId] = nil
+          session.central.cancelPeripheralConnection(peripheral)
+          pending.fail(.make("OperationTimedOut", reason: "The connection did not complete in time", deviceId: deviceId))
+          _ = self
         }
-      )
+        connection.timeout = timeout
+        queue.asyncAfter(deadline: .now() + .milliseconds(timeoutMs), execute: timeout)
+      }
+      session.connections[deviceId] = connection
+      peripheral.delegate = session.delegate
+      // A peripheral the system holds connected (another app, or restoration) connects at once.
+      session.central.connect(peripheral, options: nil)
+    }
+  }
+
+  /// The peripheral for `deviceId`: one seen this session, or one the system knows by identifier.
+  private func peripheral(_ session: Session, _ deviceId: String) -> CBPeripheral? {
+    if let known = session.peripherals[deviceId] {
+      return known
+    }
+    guard let uuid = UUID(uuidString: deviceId),
+      let found = session.central.retrievePeripherals(withIdentifiers: [uuid]).first
+    else {
+      return nil
+    }
+    session.peripherals[deviceId] = found
+    return found
+  }
+
+  fileprivate func didConnect(_ session: Session, _ peripheral: CBPeripheral) {
+    let deviceId = peripheral.identifier.uuidString
+    guard var connection = session.connections[deviceId], connection.phase == .connecting else {
+      // An attempt abandoned since: CoreBluetooth connected anyway; let it go.
+      session.central.cancelPeripheralConnection(peripheral)
+      return
+    }
+    connection.timeout?.cancel()
+    connection.timeout = nil
+    connection.phase = .connected
+    let pending = connection.connect
+    connection.connect = nil
+    session.connections[deviceId] = connection
+    pending?.succeed(.success(session.generation, record(session, peripheral)))
+  }
+
+  fileprivate func didFailToConnect(_ session: Session, _ peripheral: CBPeripheral, _ error: Error?) {
+    let deviceId = peripheral.identifier.uuidString
+    guard let connection = session.connections[deviceId], connection.phase == .connecting else { return }
+    connection.timeout?.cancel()
+    session.connections[deviceId] = nil
+    connection.connect?.fail(BleConversions.error(error, "DeviceConnectionFailed", deviceId: deviceId))
+  }
+
+  fileprivate func didDisconnect(_ session: Session, _ peripheral: CBPeripheral, _ error: Error?) {
+    let deviceId = peripheral.identifier.uuidString
+    guard let connection = session.connections[deviceId] else { return }
+    if connection.phase == .connecting {
+      // A pending connection that ended before it was made fails the attempt.
+      connection.timeout?.cancel()
+      session.connections[deviceId] = nil
+      connection.connect?.fail(BleConversions.error(error, "DeviceConnectionFailed", deviceId: deviceId))
+      return
+    }
+    endConnection(
+      session, deviceId,
+      error: error.map { BleConversions.error($0, "DeviceDisconnected", deviceId: deviceId) }
+    )
+  }
+
+  /// A connection ended: its requests fail, its handles and monitors go, and JavaScript hears once.
+  private func endConnection(_ session: Session, _ deviceId: String, error: BleErrorRecord?) {
+    guard let connection = session.connections.removeValue(forKey: deviceId) else { return }
+    connection.timeout?.cancel()
+    let failure = error ?? .make("DeviceDisconnected", deviceId: deviceId)
+    connection.connect?.fail(failure)
+    session.waiters[deviceId]?.failAll(.make("DeviceDisconnected", deviceId: deviceId))
+    session.waiters[deviceId] = nil
+    for (subscriptionId, monitor) in session.monitors where monitor.deviceId == deviceId {
+      session.monitors[subscriptionId] = nil
+    }
+    _ = session.forget(deviceId)
+    let snapshot = session.peripherals[deviceId].map { record(session, $0) } ?? BleConversions.minimalPeripheral(deviceId)
+    for cancel in connection.cancels {
+      cancel.succeed(.success(session.generation, snapshot))
+    }
+    if connection.phase != .connecting {
+      sink?.emit(disconnect: DisconnectEventRecord(generation: session.generation, deviceId: deviceId, error: error))
     }
   }
 
   func cancelConnection(_ generation: Int, _ deviceId: String) async -> PeripheralResultRecord {
     await run(generation, PeripheralResultRecord.self) { [self] session, pending in
-      guard let connection = session.connections[deviceId] else {
-        // Not tracked by this session: let the adapter decide, and report its "nothing to cancel"
-        // rejection as "not connected".
-        session.adapter.cancelDeviceConnection(deviceId, resolve: { [weak self] value in
-          self?.confined {
-            pending.succeed(.success(generation, BleConversions.peripheral(value) ?? BleConversions.minimalPeripheral(deviceId)))
-          }
-        }, reject: { [weak self] _, message, _ in
-          self?.confined {
-            let error = BleConversions.error(message)
-            pending.fail(error.code == "OperationCancelled" ? .make("DeviceNotConnected", deviceId: deviceId) : error)
-          }
-        })
+      guard var connection = session.connections[deviceId] else {
+        pending.fail(.make("DeviceNotConnected", deviceId: deviceId))
+        return
+      }
+      guard let peripheral = session.peripherals[deviceId] else {
+        endConnection(session, deviceId, error: nil)
+        pending.succeed(.success(generation, BleConversions.minimalPeripheral(deviceId)))
         return
       }
       switch connection.phase {
-      case .cancelling:
-        pending.fail(.make("OperationStartFailed", reason: "The connection is already being cancelled", deviceId: deviceId))
       case .connecting:
-        // Abandon the attempt. Its own callbacks settle the connect request as cancelled; the
-        // adapter then rejects this cancel as "cancelled", which here means success.
+        // Abandon the attempt: its connect settles as cancelled, and CoreBluetooth stops trying.
+        connection.timeout?.cancel()
         session.connections[deviceId] = nil
-        session.adapter.cancelDeviceConnection(deviceId, resolve: { [weak self] value in
-          self?.confined {
-            pending.succeed(.success(generation, BleConversions.peripheral(value) ?? BleConversions.minimalPeripheral(deviceId)))
-          }
-        }, reject: { [weak self] _, _, _ in
-          self?.confined { pending.succeed(.success(generation, BleConversions.minimalPeripheral(deviceId))) }
-        })
-      case .connected:
-        let token = connection.token
-        session.connections[deviceId]?.phase = .cancelling
-        session.adapter.cancelDeviceConnection(deviceId, resolve: { [weak self, weak session] value in
-          self?.confined {
-            if let engine = self, let session, session.connections[deviceId]?.token == token {
-              // The adapter's disconnection event may not have arrived; report it exactly once.
-              engine.disconnected(session, deviceId: deviceId, error: nil)
-            }
-            pending.succeed(.success(generation, BleConversions.peripheral(value) ?? BleConversions.minimalPeripheral(deviceId)))
-          }
-        }, reject: { [weak self, weak session] _, message, _ in
-          self?.confined {
-            if let session, session.connections[deviceId]?.token == token {
-              session.connections[deviceId]?.phase = .connected
-            }
-            pending.fail(BleConversions.error(message))
-          }
-        })
+        connection.connect?.fail(.make("OperationCancelled", deviceId: deviceId))
+        session.central.cancelPeripheralConnection(peripheral)
+        pending.succeed(.success(generation, record(session, peripheral)))
+      case .connected, .cancelling:
+        // Settles when CoreBluetooth reports the disconnection.
+        connection.phase = .cancelling
+        connection.cancels.append(pending)
+        session.connections[deviceId] = connection
+        session.central.cancelPeripheralConnection(peripheral)
       }
     }
   }
 
   func isConnected(_ generation: Int, _ deviceId: String) async -> BoolResultRecord {
     await run(generation, BoolResultRecord.self) { [self] session, pending in
-      session.adapter.isDeviceConnected(deviceId, resolve: { value in
-        pending.succeed(.success(generation, BleConversions.bool(value) ?? false))
-      }, reject: reject(pending))
+      pending.succeed(.success(generation, peripheral(session, deviceId)?.state == .connected))
     }
   }
 
   func known(_ generation: Int, _ deviceIds: [String]) async -> PeripheralListResultRecord {
     await run(generation, PeripheralListResultRecord.self) { [self] session, pending in
-      session.adapter.devices(deviceIds, resolve: { [weak self] value in
-        self?.confined { self?.settleList(pending, generation, value) }
-      }, reject: reject(pending))
+      let uuids = deviceIds.compactMap(UUID.init(uuidString:))
+      guard uuids.count == deviceIds.count else {
+        pending.fail(.make("InvalidIdentifiers"))
+        return
+      }
+      let found = session.central.retrievePeripherals(withIdentifiers: uuids)
+      for peripheral in found {
+        session.peripherals[peripheral.identifier.uuidString] = peripheral
+      }
+      pending.succeed(.success(generation, found.map { record(session, $0) }))
     }
   }
 
   func connected(_ generation: Int, _ services: [String]) async -> PeripheralListResultRecord {
     await run(generation, PeripheralListResultRecord.self) { [self] session, pending in
-      session.adapter.connectedDevices(services, resolve: { [weak self] value in
-        self?.confined { self?.settleList(pending, generation, value) }
-      }, reject: reject(pending))
-    }
-  }
-
-  private func settleList(_ pending: Pending<PeripheralListResultRecord>, _ generation: Int, _ value: Any?) {
-    if let devices = BleConversions.peripherals(value) {
-      pending.succeed(.success(generation, devices))
-    } else {
-      pending.fail(.make("InvalidNativeResult"))
+      guard services.allSatisfy(BleConversions.isUUID) else {
+        pending.fail(.make("InvalidIdentifiers"))
+        return
+      }
+      let found = session.central.retrieveConnectedPeripherals(withServices: services.map { CBUUID(string: $0) })
+      for peripheral in found {
+        session.peripherals[peripheral.identifier.uuidString] = peripheral
+      }
+      pending.succeed(.success(generation, found.map { record(session, $0) }))
     }
   }
 
@@ -553,300 +884,410 @@ final class BleEngine: @unchecked Sendable {
 
   func discover(_ generation: Int, _ deviceId: String, _ transactionId: String) async -> GattTreeResultRecord {
     await run(generation, GattTreeResultRecord.self) { [self] session, pending in
-      guard let connection = session.connections[deviceId], connection.phase == .connected else {
-        pending.fail(.make("DeviceNotConnected", deviceId: deviceId))
-        return
+      session.begin(pending, transactionId)
+      onPeripheral(session, pending, deviceId) { peripheral in
+        if let previous = session.waiters[deviceId]?.discovery {
+          previous.pending.fail(.make("OperationCancelled", deviceId: deviceId))
+        }
+        session.waiters[deviceId, default: PeripheralWaiters()].discovery = Discovery(pending: pending, outstanding: 1)
+        peripheral.discoverServices(nil)
       }
-      let transaction = session.begin(pending, transactionId)
-      session.adapter.discoverAllServicesAndCharacteristicsForDevice(
-        deviceId,
-        transactionId: transaction,
-        resolve: { [weak self, weak session] _ in
-          self?.confined {
-            guard let engine = self, let session, session.connections[deviceId]?.token == connection.token else {
-              pending.fail(.make("DeviceDisconnected", deviceId: deviceId))
-              return
-            }
-            switch engine.gattTree(session, deviceId) {
-            case let .success(tree): pending.succeed(.success(generation, tree))
-            case let .failure(error): pending.fail(error.record)
-            }
-          }
-        },
-        reject: reject(pending)
-      )
     }
   }
 
-  private struct TreeError: Error {
-    let record: BleErrorRecord
+  private func discoveryStep(
+    _ session: Session, _ peripheral: CBPeripheral, _ error: Error?, _ code: String, _ more: () -> Int
+  ) {
+    let deviceId = peripheral.identifier.uuidString
+    guard var discovery = session.waiters[deviceId]?.discovery else { return }
+    if discovery.pending.settled {
+      session.waiters[deviceId]?.discovery = nil
+      return
+    }
+    if let error {
+      session.waiters[deviceId]?.discovery = nil
+      discovery.pending.fail(BleConversions.error(error, code, deviceId: deviceId))
+      return
+    }
+    discovery.outstanding += more() - 1
+    if discovery.outstanding > 0 {
+      session.waiters[deviceId]?.discovery = discovery
+      return
+    }
+    session.waiters[deviceId]?.discovery = nil
+    discovery.pending.succeed(.success(session.generation, tree(session, peripheral)))
   }
 
-  /// Reads the adapter's caches after discovery. These getters call back synchronously.
-  private func gattTree(_ session: Session, _ deviceId: String) -> Result<GattTreeRecord, TreeError> {
-    var failure: BleErrorRecord?
+  fileprivate func didDiscoverServices(_ session: Session, _ peripheral: CBPeripheral, _ error: Error?) {
+    discoveryStep(session, peripheral, error, "ServicesDiscoveryFailed") {
+      let services = peripheral.services ?? []
+      services.forEach { peripheral.discoverCharacteristics(nil, for: $0) }
+      return services.count
+    }
+  }
+
+  fileprivate func didDiscoverCharacteristics(
+    _ session: Session, _ peripheral: CBPeripheral, _ service: CBService, _ error: Error?
+  ) {
+    discoveryStep(session, peripheral, error, "CharacteristicsDiscoveryFailed") {
+      let characteristics = service.characteristics ?? []
+      characteristics.forEach { peripheral.discoverDescriptors(for: $0) }
+      return characteristics.count
+    }
+  }
+
+  fileprivate func didDiscoverDescriptors(_ session: Session, _ peripheral: CBPeripheral, _ error: Error?) {
+    discoveryStep(session, peripheral, error, "DescriptorsDiscoveryFailed") { 0 }
+  }
+
+  /// The discovered table, with fresh handles for this discovery; earlier handles die.
+  private func tree(_ session: Session, _ peripheral: CBPeripheral) -> GattTreeRecord {
+    let deviceId = peripheral.identifier.uuidString
+    _ = session.forget(deviceId)
     var services: [ServiceRecord] = []
     var characteristics: [CharacteristicRecord] = []
     var descriptors: [DescriptorRecord] = []
-    let invalid = BleErrorRecord.make("InvalidNativeResult", deviceId: deviceId)
-
-    session.adapter.servicesForDevice(deviceId, resolve: { value in
-      if let converted = BleConversions.list(value, BleConversions.service) {
-        services = converted
-      } else {
-        failure = failure ?? invalid
+    for service in peripheral.services ?? [] {
+      let serviceHandle = session.assign(service, .service(deviceId: deviceId, service: service))
+      let serviceUUID = BleConversions.uuid(service.uuid)
+      services.append(ServiceRecord(deviceId: deviceId, handle: serviceHandle, uuid: serviceUUID, isPrimary: service.isPrimary))
+      for characteristic in service.characteristics ?? [] {
+        let handle = session.assign(
+          characteristic, .characteristic(deviceId: deviceId, characteristic: characteristic, service: serviceHandle)
+        )
+        let properties = characteristic.properties
+        characteristics.append(CharacteristicRecord(
+          deviceId: deviceId, handle: handle, uuid: BleConversions.uuid(characteristic.uuid),
+          serviceHandle: serviceHandle, serviceUUID: serviceUUID,
+          isReadable: properties.contains(.read),
+          isWritableWithResponse: properties.contains(.write),
+          isWritableWithoutResponse: properties.contains(.writeWithoutResponse),
+          isNotifiable: properties.contains(.notify),
+          isNotifying: characteristic.isNotifying,
+          isIndicatable: properties.contains(.indicate),
+          value: characteristic.value
+        ))
+        for descriptor in characteristic.descriptors ?? [] {
+          let descriptorHandle = session.assign(
+            descriptor,
+            .descriptor(deviceId: deviceId, descriptor: descriptor, characteristic: handle, service: serviceHandle)
+          )
+          descriptors.append(DescriptorRecord(
+            deviceId: deviceId, handle: descriptorHandle, uuid: BleConversions.uuid(descriptor.uuid),
+            characteristicHandle: handle, characteristicUUID: BleConversions.uuid(characteristic.uuid),
+            serviceHandle: serviceHandle, serviceUUID: serviceUUID,
+            value: BleConversions.descriptorValue(descriptor.value)
+          ))
+        }
       }
-    }, reject: { _, message, _ in failure = failure ?? BleConversions.error(message) })
-    for service in services {
-      session.adapter.characteristicsForService(service.handle, resolve: { value in
-        if let converted = BleConversions.list(value, BleConversions.characteristic) {
-          characteristics.append(contentsOf: converted)
-        } else {
-          failure = failure ?? invalid
-        }
-      }, reject: { _, message, _ in failure = failure ?? BleConversions.error(message) })
     }
-    for characteristic in characteristics {
-      session.handleDevices[characteristic.handle] = deviceId
-      session.adapter.descriptorsForCharacteristic(characteristic.handle, resolve: { value in
-        if let converted = BleConversions.list(value, BleConversions.descriptor) {
-          descriptors.append(contentsOf: converted)
-        } else {
-          failure = failure ?? invalid
-        }
-      }, reject: { _, message, _ in failure = failure ?? BleConversions.error(message) })
-    }
-    if let failure {
-      return .failure(TreeError(record: failure))
-    }
-    return .success(GattTreeRecord(deviceId: deviceId, services: services, characteristics: characteristics, descriptors: descriptors))
+    return GattTreeRecord(deviceId: deviceId, services: services, characteristics: characteristics, descriptors: descriptors)
   }
 
   // MARK: GATT operations
 
+  /// A characteristic's failure, with where it happened.
+  private func failure(_ code: String, _ characteristic: CBCharacteristic, _ deviceId: String, _ error: Error?) -> BleErrorRecord {
+    var record = BleConversions.error(error, code, deviceId: deviceId)
+    record.serviceUUID = characteristic.service.map { BleConversions.uuid($0.uuid) }
+    record.characteristicUUID = BleConversions.uuid(characteristic.uuid)
+    return record
+  }
+
   func read(_ generation: Int, _ handle: Double, _ transactionId: String) async -> BytesResultRecord {
     await run(generation, BytesResultRecord.self) { [self] session, pending in
-      let transaction = session.begin(pending, transactionId)
-      session.adapter.readCharacteristic(handle, transactionId: transaction, resolve: { [weak self] value in
-        self?.confined {
-          let characteristic = BleConversions.dictionary(value)
-          pending.succeed(.success(generation, BleConversions.bytes(characteristic?["value"]) ?? Data()))
-        }
-      }, reject: reject(pending))
+      session.begin(pending, transactionId)
+      guard let (deviceId, characteristic) = characteristicAt(session, handle) else {
+        pending.fail(.make("CharacteristicNotFound"))
+        return
+      }
+      onPeripheral(session, pending, deviceId) { peripheral in
+        session.waiters[deviceId, default: PeripheralWaiters()].reads[ObjectIdentifier(characteristic), default: Waiters()]
+          .append(pending)
+        peripheral.readValue(for: characteristic)
+      }
+    }
+  }
+
+  fileprivate func didUpdateValue(
+    _ session: Session, _ peripheral: CBPeripheral, _ characteristic: CBCharacteristic, _ error: Error?
+  ) {
+    let deviceId = peripheral.identifier.uuidString
+    let key = ObjectIdentifier(characteristic)
+    // A read's answer goes to the read; anything else is a notification or indication.
+    if let reader = session.waiters[deviceId]?.reads[key]?.pop() {
+      if let error {
+        reader.fail(failure("CharacteristicReadFailed", characteristic, deviceId, error))
+      } else {
+        reader.succeed(.success(session.generation, characteristic.value ?? Data()))
+      }
+      return
+    }
+    guard let handle = session.handle(of: characteristic) else { return }
+    for (subscriptionId, monitor) in session.monitors where monitor.characteristic == handle {
+      if let error {
+        session.monitors[subscriptionId] = nil
+        sink?.emit(notification: NotificationEventRecord(
+          generation: session.generation, subscriptionId: subscriptionId, value: nil,
+          error: failure("CharacteristicNotifyChangeFailed", characteristic, deviceId, error)
+        ))
+      } else {
+        sink?.emit(notification: NotificationEventRecord(
+          generation: session.generation, subscriptionId: subscriptionId, value: characteristic.value ?? Data(), error: nil
+        ))
+      }
     }
   }
 
   func write(_ generation: Int, _ handle: Double, _ value: Data, _ withResponse: Bool, _ transactionId: String) async -> VoidResultRecord {
     await run(generation, VoidResultRecord.self) { [self] session, pending in
-      let transaction = session.begin(pending, transactionId)
-      session.adapter.writeCharacteristic(
-        handle, valueBase64: value.base64EncodedString(), response: withResponse, transactionId: transaction,
-        resolve: { [weak self] _ in self?.confined { pending.succeed(.ok(generation)) } },
-        reject: reject(pending)
-      )
+      session.begin(pending, transactionId)
+      guard let (deviceId, characteristic) = characteristicAt(session, handle) else {
+        pending.fail(.make("CharacteristicNotFound"))
+        return
+      }
+      onPeripheral(session, pending, deviceId) { peripheral in
+        if withResponse {
+          session.waiters[deviceId, default: PeripheralWaiters()].writes[ObjectIdentifier(characteristic), default: Waiters()]
+            .append(pending)
+          peripheral.writeValue(value, for: characteristic, type: .withResponse)
+        } else if session.waiters[deviceId]?.unsent.isEmpty ?? true, peripheral.canSendWriteWithoutResponse {
+          peripheral.writeValue(value, for: characteristic, type: .withoutResponse)
+          pending.succeed(.ok(generation))
+        } else {
+          // Backpressure: wait for CoreBluetooth's queue to have room, in order.
+          session.waiters[deviceId, default: PeripheralWaiters()].unsent.append((pending, characteristic, value))
+        }
+      }
+    }
+  }
+
+  fileprivate func readyToWrite(_ session: Session, _ peripheral: CBPeripheral) {
+    let deviceId = peripheral.identifier.uuidString
+    while peripheral.canSendWriteWithoutResponse, let next = session.waiters[deviceId]?.unsent.first {
+      session.waiters[deviceId]?.unsent.removeFirst()
+      guard !next.pending.settled else { continue }
+      peripheral.writeValue(next.value, for: next.characteristic, type: .withoutResponse)
+      next.pending.succeed(.ok(session.generation))
+    }
+  }
+
+  fileprivate func didWrite(_ session: Session, _ peripheral: CBPeripheral, _ characteristic: CBCharacteristic, _ error: Error?) {
+    let deviceId = peripheral.identifier.uuidString
+    guard let writer = session.waiters[deviceId]?.writes[ObjectIdentifier(characteristic)]?.pop() else { return }
+    if let error {
+      writer.fail(failure("CharacteristicWriteFailed", characteristic, deviceId, error))
+    } else {
+      writer.succeed(.ok(session.generation))
     }
   }
 
   func readDescriptor(_ generation: Int, _ handle: Double, _ transactionId: String) async -> BytesResultRecord {
     await run(generation, BytesResultRecord.self) { [self] session, pending in
-      let transaction = session.begin(pending, transactionId)
-      session.adapter.readDescriptor(handle, transactionId: transaction, resolve: { [weak self] value in
-        self?.confined {
-          let descriptor = BleConversions.dictionary(value)
-          if let bytes = BleConversions.bytes(descriptor?["value"]) {
-            pending.succeed(.success(generation, bytes))
-          } else {
-            // The adapter only encodes values of the standard GATT descriptors it recognizes.
-            pending.fail(.make(
-              "DescriptorReadFailed",
-              reason: "The iOS adapter cannot represent this descriptor's value",
-              deviceId: BleConversions.string(descriptor?["deviceID"]),
-              serviceUUID: BleConversions.string(descriptor?["serviceUUID"]),
-              characteristicUUID: BleConversions.string(descriptor?["characteristicUUID"]),
-              descriptorUUID: BleConversions.string(descriptor?["uuid"])
-            ))
-          }
-        }
-      }, reject: reject(pending))
+      session.begin(pending, transactionId)
+      guard let (deviceId, descriptor) = descriptorAt(session, handle) else {
+        pending.fail(.make("DescriptorNotFound"))
+        return
+      }
+      onPeripheral(session, pending, deviceId) { peripheral in
+        session.waiters[deviceId, default: PeripheralWaiters()].descriptorReads[ObjectIdentifier(descriptor), default: Waiters()]
+          .append(pending)
+        peripheral.readValue(for: descriptor)
+      }
+    }
+  }
+
+  fileprivate func didReadDescriptor(_ session: Session, _ peripheral: CBPeripheral, _ descriptor: CBDescriptor, _ error: Error?) {
+    let deviceId = peripheral.identifier.uuidString
+    guard let reader = session.waiters[deviceId]?.descriptorReads[ObjectIdentifier(descriptor)]?.pop() else { return }
+    if let error {
+      reader.fail(BleConversions.error(error, "DescriptorReadFailed", deviceId: deviceId))
+    } else if let bytes = BleConversions.descriptorValue(descriptor.value) {
+      reader.succeed(.success(session.generation, bytes))
+    } else {
+      reader.fail(.make(
+        "DescriptorReadFailed", reason: "CoreBluetooth gave this descriptor's value in no form the library knows",
+        deviceId: deviceId, descriptorUUID: BleConversions.uuid(descriptor.uuid)
+      ))
     }
   }
 
   func writeDescriptor(_ generation: Int, _ handle: Double, _ value: Data, _ transactionId: String) async -> VoidResultRecord {
     await run(generation, VoidResultRecord.self) { [self] session, pending in
-      let transaction = session.begin(pending, transactionId)
-      session.adapter.writeDescriptor(
-        handle, valueBase64: value.base64EncodedString(), transactionId: transaction,
-        resolve: { [weak self] _ in self?.confined { pending.succeed(.ok(generation)) } },
-        reject: reject(pending)
-      )
+      session.begin(pending, transactionId)
+      guard let (deviceId, descriptor) = descriptorAt(session, handle) else {
+        pending.fail(.make("DescriptorNotFound"))
+        return
+      }
+      // CoreBluetooth refuses writes to the client configuration descriptor: subscribe instead.
+      if descriptor.uuid == CBUUID(string: CBUUIDClientCharacteristicConfigurationString) {
+        pending.fail(.make("DescriptorWriteNotAllowed", reason: "Use monitor to subscribe", deviceId: deviceId))
+        return
+      }
+      onPeripheral(session, pending, deviceId) { peripheral in
+        session.waiters[deviceId, default: PeripheralWaiters()].descriptorWrites[ObjectIdentifier(descriptor), default: Waiters()]
+          .append(pending)
+        peripheral.writeValue(value, for: descriptor)
+      }
+    }
+  }
+
+  fileprivate func didWriteDescriptor(_ session: Session, _ peripheral: CBPeripheral, _ descriptor: CBDescriptor, _ error: Error?) {
+    let deviceId = peripheral.identifier.uuidString
+    guard let writer = session.waiters[deviceId]?.descriptorWrites[ObjectIdentifier(descriptor)]?.pop() else { return }
+    if let error {
+      writer.fail(BleConversions.error(error, "DescriptorWriteFailed", deviceId: deviceId))
+    } else {
+      writer.succeed(.ok(session.generation))
     }
   }
 
   // MARK: Monitoring
 
+  /// Settles when the peripheral confirms the subscription (its client configuration written; on a
+  /// protected characteristic, after the pairing that write started), or fails as it refuses.
   func startMonitor(_ generation: Int, _ handle: Double, _ subscriptionId: String) async -> VoidResultRecord {
     await run(generation, VoidResultRecord.self) { [self] session, pending in
-      if let previous = session.removeMonitor(subscriptionId) {
-        session.adapter.cancelTransaction(previous.adapterTransaction)
+      session.monitors[subscriptionId] = nil
+      guard let (deviceId, characteristic) = characteristicAt(session, handle) else {
+        pending.fail(.make("CharacteristicNotFound"))
+        return
       }
-      let transaction = "m\(generation).\(session.nextSerial())"
-      session.monitors[subscriptionId] = Monitor(adapterTransaction: transaction, deviceId: session.handleDevices[handle])
-      session.monitorTransactions[transaction] = subscriptionId
-      // The adapter never resolves a monitor; it rejects only when the subscription is disposed.
-      session.adapter.monitorCharacteristic(handle, transactionId: transaction, resolve: { _ in }, reject: { [weak self, weak session] _, message, _ in
-        self?.confined {
-          guard let engine = self, let session, session.monitorTransactions[transaction] == subscriptionId else {
-            return
-          }
-          _ = session.removeMonitor(subscriptionId)
-          engine.sinkBox.sink?.emit(notification: NotificationEventRecord(
-            generation: session.generation, subscriptionId: subscriptionId, value: nil, error: BleConversions.error(message)
-          ))
+      onPeripheral(session, pending, deviceId) { peripheral in
+        session.monitors[subscriptionId] = Monitor(deviceId: deviceId, characteristic: handle)
+        let key = ObjectIdentifier(characteristic)
+        let confirming = !(session.waiters[deviceId]?.notifies[key]?.isEmpty ?? true)
+        if characteristic.isNotifying, !confirming {
+          pending.succeed(.ok(generation))
+          return
         }
-      })
-      pending.succeed(.ok(generation))
+        session.waiters[deviceId, default: PeripheralWaiters()].notifies[key, default: Waiters()].append(pending)
+        if !confirming {
+          peripheral.setNotifyValue(true, for: characteristic)
+        }
+      }
+    }
+  }
+
+  fileprivate func didUpdateNotificationState(
+    _ session: Session, _ peripheral: CBPeripheral, _ characteristic: CBCharacteristic, _ error: Error?
+  ) {
+    let deviceId = peripheral.identifier.uuidString
+    let key = ObjectIdentifier(characteristic)
+    // Every request waiting on this characteristic's subscription takes the same answer.
+    var waiting: [Pending<VoidResultRecord>] = []
+    while let next = session.waiters[deviceId]?.notifies[key]?.pop() {
+      waiting.append(next)
+    }
+    guard let handle = session.handle(of: characteristic) else { return }
+    if let error {
+      let record = failure("CharacteristicNotifyChangeFailed", characteristic, deviceId, error)
+      for (subscriptionId, monitor) in session.monitors where monitor.characteristic == handle {
+        session.monitors[subscriptionId] = nil
+      }
+      waiting.forEach { $0.fail(record) }
+      return
+    }
+    waiting.forEach { $0.succeed(.ok(session.generation)) }
+    // A subscription ended from JavaScript while its confirmation was on the way.
+    if characteristic.isNotifying, !session.monitors.values.contains(where: { $0.characteristic == handle }) {
+      peripheral.setNotifyValue(false, for: characteristic)
     }
   }
 
   /// Cancels a transaction or a monitor by its public id. Unknown ids are already settled.
   func cancel(_ generation: Int, _ transactionId: String) async -> VoidResultRecord {
-    await run(generation, VoidResultRecord.self) { session, pending in
-      if let monitor = session.removeMonitor(transactionId) {
-        session.adapter.cancelTransaction(monitor.adapterTransaction)
-      } else if let id = session.transactions[transactionId], let entry = session.pending[id] {
-        let adapterTransaction = entry.adapterTransaction
-        entry.fail(.make("OperationCancelled"))
-        if let adapterTransaction {
-          session.adapter.cancelTransaction(adapterTransaction)
+    await run(generation, VoidResultRecord.self) { [self] session, pending in
+      if let monitor = session.monitors.removeValue(forKey: transactionId) {
+        let others = session.monitors.values.contains { $0.characteristic == monitor.characteristic }
+        if !others, let (deviceId, characteristic) = characteristicAt(session, monitor.characteristic),
+          let peripheral = session.peripherals[deviceId], peripheral.state == .connected, characteristic.isNotifying
+        {
+          peripheral.setNotifyValue(false, for: characteristic)
         }
+      } else if let id = session.transactions[transactionId], let entry = session.pending[id] {
+        entry.fail(.make("OperationCancelled"))
       }
       pending.succeed(.ok(generation))
     }
+  }
+
+  // MARK: Service changes
+
+  /// The peripheral's Service Changed: the handles under the invalidated services die, their
+  /// requests and subscriptions fail, and JavaScript hears which device to discover again.
+  fileprivate func servicesChanged(_ session: Session, _ peripheral: CBPeripheral, _ invalidated: [CBService]) {
+    let deviceId = peripheral.identifier.uuidString
+    let services = Set(invalidated.map { ObjectIdentifier($0) })
+    let changed = BleErrorRecord.make("ServicesChanged", reason: "The peripheral's services changed", deviceId: deviceId)
+    if var waiters = session.waiters[deviceId] {
+      for service in invalidated {
+        for characteristic in service.characteristics ?? [] {
+          let key = ObjectIdentifier(characteristic)
+          waiters.reads[key]?.failAll(changed)
+          waiters.writes[key]?.failAll(changed)
+          waiters.notifies[key]?.failAll(changed)
+          for descriptor in characteristic.descriptors ?? [] {
+            waiters.descriptorReads[ObjectIdentifier(descriptor)]?.failAll(changed)
+            waiters.descriptorWrites[ObjectIdentifier(descriptor)]?.failAll(changed)
+          }
+        }
+      }
+      let unsent = waiters.unsent
+      waiters.unsent = unsent.filter { item in
+        guard let service = item.characteristic.service, services.contains(ObjectIdentifier(service)) else { return true }
+        item.pending.fail(changed)
+        return false
+      }
+      session.waiters[deviceId] = waiters
+    }
+    let dropped = Set(session.forget(deviceId, services: services))
+    for (subscriptionId, monitor) in session.monitors where dropped.contains(monitor.characteristic) {
+      session.monitors[subscriptionId] = nil
+      sink?.emit(notification: NotificationEventRecord(
+        generation: session.generation, subscriptionId: subscriptionId, value: nil, error: changed
+      ))
+    }
+    sink?.emit(servicesChange: ServicesChangeEventRecord(generation: session.generation, deviceId: deviceId))
   }
 
   // MARK: Device requests
 
   func rssi(_ generation: Int, _ deviceId: String, _ transactionId: String) async -> PeripheralResultRecord {
     await run(generation, PeripheralResultRecord.self) { [self] session, pending in
-      let transaction = session.begin(pending, transactionId)
-      session.adapter.readRSSIForDevice(deviceId, transactionId: transaction, resolve: peripheralResolve(pending, generation, deviceId), reject: reject(pending))
+      session.begin(pending, transactionId)
+      onPeripheral(session, pending, deviceId) { peripheral in
+        session.waiters[deviceId, default: PeripheralWaiters()].rssi.append(pending)
+        peripheral.readRSSI()
+      }
     }
   }
 
+  fileprivate func didReadRSSI(_ session: Session, _ peripheral: CBPeripheral, _ rssi: NSNumber, _ error: Error?) {
+    let deviceId = peripheral.identifier.uuidString
+    guard let reader = session.waiters[deviceId]?.rssi.pop() else { return }
+    if let error {
+      reader.fail(BleConversions.error(error, "DeviceRSSIReadFailed", deviceId: deviceId))
+    } else {
+      reader.succeed(.success(session.generation, record(session, peripheral, rssi: rssi.intValue)))
+    }
+  }
+
+  /// CoreBluetooth negotiates the MTU itself: this reports the payload the link takes now.
   func requestMtu(_ generation: Int, _ deviceId: String, _ mtu: Int, _ transactionId: String) async -> PeripheralResultRecord {
     await run(generation, PeripheralResultRecord.self) { [self] session, pending in
-      let transaction = session.begin(pending, transactionId)
-      session.adapter.requestMTUForDevice(deviceId, mtu: mtu, transactionId: transaction, resolve: peripheralResolve(pending, generation, deviceId), reject: reject(pending))
+      onPeripheral(session, pending, deviceId) { peripheral in
+        pending.succeed(.success(generation, record(session, peripheral)))
+      }
     }
   }
 
+  /// Connection priority is Android's; iOS reports the peripheral.
   func requestPriority(_ generation: Int, _ deviceId: String, _ priority: Int, _ transactionId: String) async -> PeripheralResultRecord {
     await run(generation, PeripheralResultRecord.self) { [self] session, pending in
-      let transaction = session.begin(pending, transactionId)
-      session.adapter.requestConnectionPriorityForDevice(
-        deviceId, connectionPriority: priority, transactionId: transaction,
-        resolve: peripheralResolve(pending, generation, deviceId), reject: reject(pending)
-      )
-    }
-  }
-
-  private func peripheralResolve(_ pending: Pending<PeripheralResultRecord>, _ generation: Int, _ deviceId: String) -> Resolve {
-    { [weak self] value in
-      self?.confined {
-        pending.succeed(.success(generation, BleConversions.peripheral(value) ?? BleConversions.minimalPeripheral(deviceId)))
+      onPeripheral(session, pending, deviceId) { peripheral in
+        pending.succeed(.success(generation, record(session, peripheral)))
       }
-    }
-  }
-
-  // MARK: Adapter events
-
-  func adapterEvent(generation: Int, name: String, value: Any) {
-    confined { [self] in
-      guard let session, session.generation == generation else {
-        return
-      }
-      switch name {
-      case BleEvent.stateChangeEvent:
-        if let state = BleConversions.string(value) {
-          sinkBox.sink?.emit(stateChange: StateChangeEventRecord(generation: generation, state: state))
-        }
-      case BleEvent.restoreStateEvent:
-        let restored = BleConversions.dictionary(value).map { BleConversions.peripherals($0["connectedPeripherals"]) ?? [] }
-        finishOpen(session, restored: restored)
-      case BleEvent.scanEvent:
-        handleScan(session, value)
-      case BleEvent.readEvent:
-        handleNotification(session, value)
-      case BleEvent.disconnectionEvent:
-        guard let items = value as? [Any], items.count >= 2,
-          let deviceId = BleConversions.string(BleConversions.dictionary(items[1])?["id"])
-        else {
-          return
-        }
-        let error = BleConversions.string(items[0]).map { BleConversions.error($0) }
-        switch session.connections[deviceId]?.phase {
-        case .connected, .cancelling:
-          disconnected(session, deviceId: deviceId, error: error)
-        case .connecting, nil:
-          // Either a superseded attempt or the failure of the current attempt, which its connect
-          // result reports. Neither ends a connection JavaScript holds.
-          break
-        }
-      default:
-        break
-      }
-    }
-  }
-
-  private func disconnected(_ session: Session, deviceId: String, error: BleErrorRecord?) {
-    session.connections[deviceId] = nil
-    var ended: [String] = []
-    for (subscriptionId, monitor) in session.monitors where monitor.deviceId == deviceId {
-      _ = session.removeMonitor(subscriptionId)
-      ended.append(monitor.adapterTransaction)
-    }
-    if !ended.isEmpty {
-      // This runs inside an adapter callback; dispose the adapter's monitors on a later turn of the
-      // queue rather than re-entering its transaction map while it is still dispatching.
-      let release = QueueConfined { [weak session] in
-        guard let session else { return }
-        ended.forEach(session.adapter.cancelTransaction)
-      }
-      queue.async { release.body() }
-    }
-    sinkBox.sink?.emit(disconnect: DisconnectEventRecord(generation: session.generation, deviceId: deviceId, error: error))
-  }
-
-  private func handleScan(_ session: Session, _ value: Any) {
-    guard let scanId = session.scanId, let items = value as? [Any], items.count >= 2 else {
-      return
-    }
-    if let message = BleConversions.string(items[0]) {
-      // A scan error ends the adapter's scan.
-      session.scanId = nil
-      sinkBox.sink?.emit(scan: ScanEventRecord(generation: session.generation, scanId: scanId, device: nil, error: BleConversions.error(message)))
-    } else if let device = BleConversions.peripheral(items[1]) {
-      sinkBox.sink?.emit(scan: ScanEventRecord(generation: session.generation, scanId: scanId, device: device, error: nil))
-    }
-  }
-
-  private func handleNotification(_ session: Session, _ value: Any) {
-    guard let items = value as? [Any], items.count >= 3,
-      let transaction = BleConversions.string(items[2]),
-      let subscriptionId = session.monitorTransactions[transaction]
-    else {
-      return
-    }
-    if let message = BleConversions.string(items[0]) {
-      _ = session.removeMonitor(subscriptionId)
-      sinkBox.sink?.emit(notification: NotificationEventRecord(
-        generation: session.generation, subscriptionId: subscriptionId, value: nil, error: BleConversions.error(message)
-      ))
-    } else if let characteristic = BleConversions.dictionary(items[1]) {
-      sinkBox.sink?.emit(notification: NotificationEventRecord(
-        generation: session.generation, subscriptionId: subscriptionId,
-        value: BleConversions.bytes(characteristic["value"]) ?? Data(), error: nil
-      ))
     }
   }
 }

@@ -1,83 +1,88 @@
+import CoreBluetooth
 import Foundation
 
-/// Translates MultiplatformBleAdapter's untyped values (dictionaries, Base64 strings and the JSON
-/// error strings it passes to `reject`) into the typed records. Nothing here escapes to JavaScript.
+/// Translates CoreBluetooth's values (manager states, UUIDs, advertisement dictionaries, descriptor
+/// values and `NSError`s) into the typed records. Nothing here escapes to JavaScript.
 enum BleConversions {
-  // MARK: Scalars
+  // MARK: State
 
-  static func dictionary(_ value: Any?) -> [String: Any]? {
-    value as? [String: Any]
-  }
-
-  static func string(_ value: Any?) -> String? {
-    value as? String
-  }
-
-  static func int(_ value: Any?) -> Int? {
-    (value as? NSNumber)?.intValue
-  }
-
-  static func double(_ value: Any?) -> Double? {
-    (value as? NSNumber)?.doubleValue
-  }
-
-  static func bool(_ value: Any?) -> Bool? {
-    value as? Bool
-  }
-
-  static func strings(_ value: Any?) -> [String]? {
-    value as? [String]
-  }
-
-  static func bytes(_ value: Any?) -> Data? {
-    guard let base64 = value as? String else {
-      return nil
+  /// The TypeScript `BluetoothState` literal for a manager state.
+  static func state(_ state: CBManagerState) -> String {
+    switch state {
+    case .resetting: return "Resetting"
+    case .unsupported: return "Unsupported"
+    case .unauthorized: return "Unauthorized"
+    case .poweredOff: return "PoweredOff"
+    case .poweredOn: return "PoweredOn"
+    case .unknown: return "Unknown"
+    @unknown default: return "Unknown"
     }
-    return Data(base64Encoded: base64, options: .ignoreUnknownCharacters)
+  }
+
+  /// Why the radio cannot serve a request in `state`, or nil when it is on.
+  static func unavailable(_ state: CBManagerState) -> BleErrorRecord? {
+    switch state {
+    case .poweredOn: return nil
+    case .poweredOff: return .make("BluetoothPoweredOff")
+    case .unauthorized: return .make("BluetoothUnauthorized")
+    case .unsupported: return .make("BluetoothUnsupported")
+    case .resetting: return .make("BluetoothResetting")
+    case .unknown: return .make("BluetoothInUnknownState")
+    @unknown default: return .make("BluetoothInUnknownState")
+    }
+  }
+
+  // MARK: UUIDs
+
+  private static let base = "-0000-1000-8000-00805f9b34fb"
+
+  /// Whether CBUUID accepts `text`: 16-bit, 32-bit or 128-bit, as `CBUUID(string:)` takes them.
+  static func isUUID(_ text: String) -> Bool {
+    let hex = text.allSatisfy(\.isHexDigit)
+    switch text.count {
+    case 4, 8: return hex
+    case 36: return UUID(uuidString: text) != nil
+    default: return false
+    }
+  }
+
+  /// A UUID as the library reports every one: 128-bit, lowercase.
+  static func uuid(_ uuid: CBUUID) -> String {
+    let text = uuid.uuidString.lowercased()
+    switch text.count {
+    case 4: return "0000\(text)\(base)"
+    case 8: return "\(text)\(base)"
+    default: return text
+    }
   }
 
   // MARK: Snapshots
 
-  static func peripheral(_ value: Any?) -> PeripheralRecord? {
-    guard let object = dictionary(value), let id = string(object["id"]) else {
-      return nil
-    }
-    var serviceData: [String: Data]?
-    if let encoded = object["serviceData"] as? [String: String] {
-      serviceData = encoded.compactMapValues { Data(base64Encoded: $0, options: .ignoreUnknownCharacters) }
+  /// A snapshot of what a peripheral advertised.
+  static func advertised(_ id: String, _ name: String?, _ data: [String: Any], _ rssi: Int) -> PeripheralRecord {
+    let uuids = { (key: String) in (data[key] as? [CBUUID])?.map(uuid) }
+    let serviceData = (data[CBAdvertisementDataServiceDataKey] as? [CBUUID: Data]).map { entries in
+      Dictionary(uniqueKeysWithValues: entries.map { (uuid($0.key), $0.value) })
     }
     return PeripheralRecord(
       id: id,
-      name: string(object["name"]),
-      rssi: int(object["rssi"]),
-      mtu: int(object["mtu"]) ?? 23,
-      manufacturerData: bytes(object["manufacturerData"]),
+      name: name,
+      // CoreBluetooth reports 127 when it could not measure the signal.
+      rssi: rssi == 127 ? nil : rssi,
+      mtu: 23,
+      manufacturerData: data[CBAdvertisementDataManufacturerDataKey] as? Data,
       serviceData: serviceData,
-      serviceUUIDs: strings(object["serviceUUIDs"]),
-      localName: string(object["localName"]),
-      txPowerLevel: int(object["txPowerLevel"]),
-      solicitedServiceUUIDs: strings(object["solicitedServiceUUIDs"]),
-      rawScanRecord: bytes(object["rawScanRecord"]),
-      isConnectable: bool(object["isConnectable"]),
-      overflowServiceUUIDs: strings(object["overflowServiceUUIDs"])
+      serviceUUIDs: uuids(CBAdvertisementDataServiceUUIDsKey),
+      localName: data[CBAdvertisementDataLocalNameKey] as? String,
+      txPowerLevel: (data[CBAdvertisementDataTxPowerLevelKey] as? NSNumber)?.intValue,
+      solicitedServiceUUIDs: uuids(CBAdvertisementDataSolicitedServiceUUIDsKey),
+      rawScanRecord: nil,
+      isConnectable: (data[CBAdvertisementDataIsConnectable] as? NSNumber)?.boolValue,
+      overflowServiceUUIDs: uuids(CBAdvertisementDataOverflowServiceUUIDsKey)
     )
   }
 
-  static func peripherals(_ value: Any?) -> [PeripheralRecord]? {
-    guard let items = value as? [Any] else {
-      return nil
-    }
-    var result: [PeripheralRecord] = []
-    for item in items {
-      guard let device = peripheral(item) else {
-        return nil
-      }
-      result.append(device)
-    }
-    return result
-  }
-
-  /// A snapshot for a device the adapter no longer reports, such as an abandoned connection attempt.
+  /// A snapshot for a peripheral seen in no advertisement: one known by identifier or restored.
   static func minimalPeripheral(_ id: String) -> PeripheralRecord {
     PeripheralRecord(
       id: id, name: nil, rssi: nil, mtu: 23, manufacturerData: nil, serviceData: nil, serviceUUIDs: nil,
@@ -86,132 +91,46 @@ enum BleConversions {
     )
   }
 
-  static func service(_ value: Any?) -> ServiceRecord? {
-    guard let object = dictionary(value),
-      let handle = double(object["id"]),
-      let uuid = string(object["uuid"]),
-      let deviceId = string(object["deviceID"])
-    else {
+  /// A descriptor's value as bytes. CoreBluetooth decodes some descriptors itself: the client
+  /// configuration and extended properties as numbers, the user description as a string.
+  static func descriptorValue(_ value: Any?) -> Data? {
+    switch value {
+    case let data as Data:
+      return data
+    case let text as String:
+      return Data(text.utf8)
+    case let number as NSNumber:
+      let raw = number.uint16Value
+      return Data([UInt8(raw & 0xff), UInt8(raw >> 8)])
+    default:
       return nil
     }
-    return ServiceRecord(deviceId: deviceId, handle: handle, uuid: uuid, isPrimary: bool(object["isPrimary"]) ?? true)
-  }
-
-  static func characteristic(_ value: Any?) -> CharacteristicRecord? {
-    guard let object = dictionary(value),
-      let handle = double(object["id"]),
-      let uuid = string(object["uuid"]),
-      let serviceHandle = double(object["serviceID"]),
-      let serviceUUID = string(object["serviceUUID"]),
-      let deviceId = string(object["deviceID"])
-    else {
-      return nil
-    }
-    return CharacteristicRecord(
-      deviceId: deviceId,
-      handle: handle,
-      uuid: uuid,
-      serviceHandle: serviceHandle,
-      serviceUUID: serviceUUID,
-      isReadable: bool(object["isReadable"]) ?? false,
-      isWritableWithResponse: bool(object["isWritableWithResponse"]) ?? false,
-      isWritableWithoutResponse: bool(object["isWritableWithoutResponse"]) ?? false,
-      isNotifiable: bool(object["isNotifiable"]) ?? false,
-      isNotifying: bool(object["isNotifying"]) ?? false,
-      isIndicatable: bool(object["isIndicatable"]) ?? false,
-      value: bytes(object["value"])
-    )
-  }
-
-  static func descriptor(_ value: Any?) -> DescriptorRecord? {
-    guard let object = dictionary(value),
-      let handle = double(object["id"]),
-      let uuid = string(object["uuid"]),
-      let characteristicHandle = double(object["characteristicID"]),
-      let characteristicUUID = string(object["characteristicUUID"]),
-      let serviceHandle = double(object["serviceID"]),
-      let serviceUUID = string(object["serviceUUID"]),
-      let deviceId = string(object["deviceID"])
-    else {
-      return nil
-    }
-    return DescriptorRecord(
-      deviceId: deviceId,
-      handle: handle,
-      uuid: uuid,
-      characteristicHandle: characteristicHandle,
-      characteristicUUID: characteristicUUID,
-      serviceHandle: serviceHandle,
-      serviceUUID: serviceUUID,
-      value: bytes(object["value"])
-    )
-  }
-
-  static func list<T>(_ value: Any?, _ convert: (Any?) -> T?) -> [T]? {
-    guard let items = value as? [Any] else {
-      return nil
-    }
-    var result: [T] = []
-    for item in items {
-      guard let converted = convert(item) else {
-        return nil
-      }
-      result.append(converted)
-    }
-    return result
   }
 
   // MARK: Errors
 
-  /// MultiplatformBleAdapter's numeric codes mapped to the TypeScript `BleErrorCode` literals.
-  private static let codes: [Int: String] = [
-    0: "UnknownError", 1: "BluetoothManagerDestroyed", 2: "OperationCancelled", 3: "OperationTimedOut",
-    4: "OperationStartFailed", 5: "InvalidIdentifiers",
-    100: "BluetoothUnsupported", 101: "BluetoothUnauthorized", 102: "BluetoothPoweredOff",
-    103: "BluetoothInUnknownState", 104: "BluetoothResetting", 105: "BluetoothStateChangeFailed",
-    200: "DeviceConnectionFailed", 201: "DeviceDisconnected", 202: "DeviceRSSIReadFailed",
-    203: "DeviceAlreadyConnected", 204: "DeviceNotFound", 205: "DeviceNotConnected", 206: "DeviceMTUChangeFailed",
-    300: "ServicesDiscoveryFailed", 301: "IncludedServicesDiscoveryFailed", 302: "ServiceNotFound",
-    303: "ServicesNotDiscovered",
-    400: "CharacteristicsDiscoveryFailed", 401: "CharacteristicWriteFailed", 402: "CharacteristicReadFailed",
-    403: "CharacteristicNotifyChangeFailed", 404: "CharacteristicNotFound", 405: "CharacteristicsNotDiscovered",
-    406: "CharacteristicInvalidDataFormat",
-    500: "DescriptorsDiscoveryFailed", 501: "DescriptorWriteFailed", 502: "DescriptorReadFailed",
-    503: "DescriptorNotFound", 504: "DescriptorsNotDiscovered", 505: "DescriptorInvalidDataFormat",
-    506: "DescriptorWriteNotAllowed",
-    600: "ScanStartFailed", 601: "LocationServicesDisabled",
-  ]
-
-  /// Parses the adapter's error JSON. The adapter builds it by string interpolation without escaping,
-  /// so a reason containing quotes produces invalid JSON; then the numeric code is still recovered.
-  static func error(_ message: String?) -> BleErrorRecord {
-    guard let message else {
-      return .make("UnknownError")
+  /// A CoreBluetooth failure as a record of `defaultCode`, keeping the ATT or CoreBluetooth code:
+  /// an ATT error (insufficient authentication, say) is the peripheral's answer, the rest the system's.
+  static func error(_ error: Error?, _ defaultCode: String, deviceId: String?) -> BleErrorRecord {
+    var record = BleErrorRecord.make(defaultCode, deviceId: deviceId)
+    guard let error else {
+      return record
     }
-    guard let data = message.data(using: .utf8),
-      let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-    else {
-      return .make(scannedCode(message).flatMap { codes[$0] } ?? "UnknownError", reason: message)
+    let ns = error as NSError
+    record.reason = ns.localizedDescription
+    switch ns.domain {
+    case CBATTErrorDomain:
+      record.attErrorCode = ns.code
+    case CBErrorDomain:
+      record.iosErrorCode = ns.code
+      if ns.code == CBError.operationCancelled.rawValue {
+        record.code = "OperationCancelled"
+      } else if ns.code == CBError.connectionTimeout.rawValue, defaultCode == "DeviceConnectionFailed" {
+        record.code = "OperationTimedOut"
+      }
+    default:
+      break
     }
-    let code = int(object["errorCode"]).flatMap { codes[$0] } ?? "UnknownError"
-    return BleErrorRecord(
-      code: code,
-      reason: string(object["reason"]) ?? string(object["internalMessage"]),
-      attErrorCode: int(object["attErrorCode"]),
-      iosErrorCode: int(object["iosErrorCode"]),
-      androidErrorCode: nil,
-      deviceId: string(object["deviceID"]),
-      serviceUUID: string(object["serviceUUID"]),
-      characteristicUUID: string(object["characteristicUUID"]),
-      descriptorUUID: string(object["descriptorUUID"])
-    )
-  }
-
-  private static func scannedCode(_ message: String) -> Int? {
-    guard let key = message.range(of: "\"errorCode\":") else {
-      return nil
-    }
-    let digits = message[key.upperBound...].drop { $0 == " " }.prefix { $0.isNumber }
-    return Int(digits)
+    return record
   }
 }

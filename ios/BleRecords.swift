@@ -203,6 +203,12 @@ public struct NotificationEventRecord {
 }
 
 @Record
+public struct ServicesChangeEventRecord {
+  public var generation: Int
+  public var deviceId: String
+}
+
+@Record
 public struct DisconnectEventRecord {
   public var generation: Int
   public var deviceId: String
@@ -211,7 +217,7 @@ public struct DisconnectEventRecord {
 
 // MARK: - Sendability
 
-// Records cross from the adapter queue to the JavaScript thread. Public structs don't infer
+// Records cross from the CoreBluetooth queue to the JavaScript thread. Public structs don't infer
 // `Sendable`, so state it; every stored property is a value type.
 extension BleErrorRecord: Sendable {}
 extension OpenOptionsRecord: Sendable {}
@@ -227,6 +233,7 @@ extension StateChangeEventRecord: Sendable {}
 extension ScanEventRecord: Sendable {}
 extension NotificationEventRecord: Sendable {}
 extension DisconnectEventRecord: Sendable {}
+extension ServicesChangeEventRecord: Sendable {}
 
 // MARK: - Result construction
 

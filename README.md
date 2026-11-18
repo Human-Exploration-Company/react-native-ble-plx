@@ -6,9 +6,9 @@ Swift and Kotlin annotations replace the React Native bridge. TypeScript source
 is the public implementation; Bun handles installs, checks, linting, formatting,
 tests and package verification.
 
-The radio engines remain MultiplatformBleAdapter 0.2.0 on iOS and RxAndroidBle
-1.17.2 on Android. Their internal Base64 and callback formats stop at the native
-boundary. Public values are `Uint8Array`, errors retain platform/GATT details,
+The radio engines are CoreBluetooth, used directly, on iOS and RxAndroidBle
+1.17.2 on Android. RxAndroidBle's internal Base64 and callback formats stop at
+the native boundary. Public values are `Uint8Array`, errors retain platform/GATT details,
 and discovery preserves numeric handles for duplicate UUIDs.
 
 ## Use in an Expo app
@@ -26,11 +26,12 @@ consumers do not need a build or install lifecycle script. See the
 For Bun apps, apply the included Expo loader patch in the **app's** package.json.
 It makes Expo use Bun's native TypeScript loader, matching `slopper-topper`.
 Dependency patches do not propagate from this library into consuming apps.
-After installing the library, copy the patch:
+After installing the library, copy the patch matching your installed
+`@expo/require-utils` version (58.0.4 and 58.0.6 are included). For 58.0.6:
 
 ```sh
 mkdir -p patches
-cp node_modules/react-native-ble-plx/patches/@expo%2Frequire-utils@58.0.4.patch patches/expo-bun-loader.patch
+cp node_modules/react-native-ble-plx/patches/@expo%2Frequire-utils@58.0.6.patch patches/expo-bun-loader.patch
 ```
 
 Merge this entry into your app's `patchedDependencies`, then run `bun install`:
@@ -38,7 +39,7 @@ Merge this entry into your app's `patchedDependencies`, then run `bun install`:
 ```json
 {
   "patchedDependencies": {
-    "@expo/require-utils@58.0.4": "patches/expo-bun-loader.patch"
+    "@expo/require-utils@58.0.6": "patches/expo-bun-loader.patch"
   }
 }
 ```
@@ -139,6 +140,91 @@ The session also provides `state`, `onDisconnect`, `known`, `connected`,
 explicitly scoped. MTU and connection-priority requests are Android operations;
 the Apple engine retains its platform behavior. Read the exported types in
 [`src/types.ts`](src/types.ts) and methods in [`src/session.ts`](src/session.ts).
+
+`monitor()` takes `onReady`, called once the peripheral accepted the
+subscription: its CCCD write succeeded, after any pairing that write started
+(Android's descriptor write; CoreBluetooth's `didUpdateNotificationStateFor`).
+A refusal arrives as the monitor's error instead.
+
+`onServicesChange()` hears a connected peripheral's Service Changed on iOS
+(CoreBluetooth's `didModifyServices`). The handles under the changed services
+are gone, and monitors on them have already ended with `ServicesChanged`:
+discover the device again and subscribe again.
+
+### Android: bonds and the foreground service
+
+`ble.android` is `null` on iOS. On Android it gives what the GATT layer does
+not expose:
+
+```ts
+const android = ble.android;
+if (android) {
+  await android.bondState(device.id); // "none" | "bonding" | "bonded"
+  // Answer this device's pairing request with a passkey the app knows, so the
+  // system shows no dialog; then the protected operation that pairs.
+  await android.answerPairing(device.id, "812839");
+  const subscription = ble.monitor(characteristic, listener, {
+    onReady: () => console.log("paired and subscribed"),
+  });
+  await android.removeBond(device.id); // a hidden platform method; false if refused
+  await android.startForegroundService({ title: "My app", text: "Connected" });
+  await android.stopForegroundService();
+}
+```
+
+The library's manifest declares the `connectedDevice` foreground service and
+its permissions; ask for `POST_NOTIFICATIONS` on Android 13+ if the
+notification should show. Closing the session stops the service.
+
+### Known gaps
+
+- Android: a peripheral's Service Changed is not surfaced.
+  `BluetoothGattCallback.onServiceChanged` (Android 12+) is not forwarded by
+  RxAndroidBle 1.17.2's callback, and its `discoverServices()` keeps the
+  services it found on a connection. An operation on an invalidated handle
+  fails: reconnect, and discover on the new connection.
+
+## Virtual peripherals
+
+`react-native-ble-plx/virtual` opens the same `BleSession` over peripherals
+described in JavaScript: no radio, on a simulator, in a browser or in tests.
+Each characteristic is a handler; the peripheral notifies through its side
+of the link and can close it.
+
+```ts
+import { openVirtualBle } from "react-native-ble-plx/virtual";
+
+const ble = await openVirtualBle({
+  platform: "android", // follow Android: bonds, answerPairing, MTU requests
+  peripherals: [
+    {
+      id: "AA:BB:CC:DD:EE:FF",
+      name: "Thermometer",
+      passkey: () => "123456", // pairing by passkey entry
+      services: [
+        {
+          uuid: "181a",
+          characteristics: [
+            { uuid: "2a6e", read: () => new Uint8Array([0x10, 0x09]) },
+            {
+              uuid: "ff01",
+              notify: true,
+              authenticated: ["subscribe"], // the first subscription pairs
+              writeWithoutResponse: (value, link) => link.notify("ff01", value),
+            },
+          ],
+        },
+      ],
+    },
+  ],
+});
+```
+
+A protected operation on an unbonded link pairs, as the system would: on
+Android an armed `answerPairing` answers it; otherwise `pairing` stands in
+for the user at the dialog (by default typing the right passkey). A wrong
+passkey fails the operation with ATT error 5 and ends the link. `present`
+takes a peripheral off the air: a scan misses it and a connect waits for it.
 
 ## Develop with Bun and Nix
 

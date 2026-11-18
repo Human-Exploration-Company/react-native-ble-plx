@@ -2,7 +2,7 @@ import ExpoModulesCore
 import Foundation
 
 /// The Expo Modules 2.0 binding for src/NativeBlePlx.ts. Each `@JS` method starts on the JavaScript
-/// thread, hands its work to the engine's serial adapter queue and returns a result record; BLE
+/// thread, hands its work to the engine's serial CoreBluetooth queue and returns a result record; BLE
 /// failures travel inside the record, so the returned promises never reject for radio errors.
 @ExpoModule("BlePlx")
 public final class BlePlxModule: Module {
@@ -19,6 +19,10 @@ public final class BlePlxModule: Module {
 
   @Event
   var onDisconnect: (DisconnectEventRecord) -> Void
+
+  /// A peripheral's Service Changed: its handles under the changed services are gone.
+  @Event
+  var onServicesChange: (ServicesChangeEventRecord) -> Void
 
   public override func willDestroy() {
     engine.destroy()
@@ -153,10 +157,11 @@ public final class BlePlxModule: Module {
   }
 }
 
-// Events are emitted from the adapter queue; the default `@Event` schedules onto the JS thread.
+// Events are emitted from the CoreBluetooth queue; the default `@Event` schedules onto the JS thread.
 extension BlePlxModule: BleEventSink {
   func emit(stateChange event: StateChangeEventRecord) { onStateChange(event) }
   func emit(scan event: ScanEventRecord) { onScan(event) }
   func emit(notification event: NotificationEventRecord) { onNotification(event) }
   func emit(disconnect event: DisconnectEventRecord) { onDisconnect(event) }
+  func emit(servicesChange event: ServicesChangeEventRecord) { onServicesChange(event) }
 }

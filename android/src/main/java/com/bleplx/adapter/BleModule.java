@@ -701,7 +701,7 @@ public class BleModule implements BleAdapter {
       return;
     }
 
-    safeMonitorCharacteristicForDevice(characteristic, transactionId, subscriptionType, onEventCallback, onErrorCallback);
+    safeMonitorCharacteristicForDevice(characteristic, transactionId, subscriptionType, null, onEventCallback, onErrorCallback);
   }
 
   @Override
@@ -717,7 +717,20 @@ public class BleModule implements BleAdapter {
       return;
     }
 
-    safeMonitorCharacteristicForDevice(characteristic, transactionId, subscriptionType, onEventCallback, onErrorCallback);
+    safeMonitorCharacteristicForDevice(characteristic, transactionId, subscriptionType, null, onEventCallback, onErrorCallback);
+  }
+
+  @Override
+  public void monitorCharacteristic(int characteristicIdentifier, String transactionId, String subscriptionType,
+                                    Runnable onReady,
+                                    OnEventCallback<Characteristic> onEventCallback,
+                                    OnErrorCallback onErrorCallback) {
+    final Characteristic characteristic = getCharacteristicOrEmitError(characteristicIdentifier, onErrorCallback);
+    if (characteristic == null) {
+      return;
+    }
+
+    safeMonitorCharacteristicForDevice(characteristic, transactionId, subscriptionType, onReady, onEventCallback, onErrorCallback);
   }
 
   @Override
@@ -729,7 +742,7 @@ public class BleModule implements BleAdapter {
       return;
     }
 
-    safeMonitorCharacteristicForDevice(characteristic, transactionId, subscriptionType, onEventCallback, onErrorCallback);
+    safeMonitorCharacteristicForDevice(characteristic, transactionId, subscriptionType, null, onEventCallback, onErrorCallback);
   }
 
   @Override
@@ -1460,6 +1473,7 @@ public class BleModule implements BleAdapter {
   private void safeMonitorCharacteristicForDevice(final Characteristic characteristic,
                                                   final String transactionId,
                                                   final String subscriptionType,
+                                                  @Nullable final Runnable onReady,
                                                   final OnEventCallback<Characteristic> onEventCallback,
                                                   final OnErrorCallback onErrorCallback) {
     final RxBleConnection connection = getConnectionOrEmitError(characteristic.getDeviceId(), onErrorCallback);
@@ -1486,6 +1500,10 @@ public class BleModule implements BleAdapter {
         }
 
         return Observable.error(new CannotMonitorCharacteristicException(characteristic));
+      })
+      // The outer observable emits once the CCCD write has succeeded.
+      .doOnNext(ignored -> {
+        if (onReady != null) onReady.run();
       })
       .flatMap(observable -> observable)
       .toFlowable(BackpressureStrategy.BUFFER)

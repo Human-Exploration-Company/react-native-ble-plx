@@ -11,6 +11,11 @@
       "react-native": "./src/index.ts",
       "default": "./src/index.ts"
     },
+    "./virtual": {
+      "types": "./src/virtual.ts",
+      "react-native": "./src/virtual.ts",
+      "default": "./src/virtual.ts"
+    },
     "./app.plugin": "./app.plugin.ts",
     "./app.plugin.ts": "./app.plugin.ts",
     "./package.json": "./package.json"
@@ -26,7 +31,8 @@
     "ios",
     "expo-module.config.json",
     "app.plugin.ts",
-    "patches/@expo%2Frequire-utils@58.0.4.patch"
+    "patches/@expo%2Frequire-utils@58.0.4.patch",
+    "patches/@expo%2Frequire-utils@58.0.6.patch"
   ],
   "workspaces": [
     "example"
@@ -66,7 +72,7 @@
     "@types/react": "~19.3.0",
     "expo": "~58.0.19",
     "react": "19.3.0",
-    "react-native": "0.88.0"
+    "react-native": "0.88.1"
   },
   "repository": "https://github.com/Human-Exploration-Company/react-native-ble-plx.git",
   "homepage": "https://github.com/Human-Exploration-Company/react-native-ble-plx#readme",
@@ -76,6 +82,7 @@
   "author": "Human Exploration Company; original BLE adapters by Polidea and dotintent",
   "license": "Apache-2.0",
   "patchedDependencies": {
-    "@expo/require-utils@58.0.4": "patches/@expo%2Frequire-utils@58.0.4.patch"
+    "@expo/require-utils@58.0.4": "patches/@expo%2Frequire-utils@58.0.4.patch",
+    "@expo/require-utils@58.0.6": "patches/@expo%2Frequire-utils@58.0.6.patch"
   }
 }

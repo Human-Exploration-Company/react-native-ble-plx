@@ -83,6 +83,11 @@ export interface NativeEvents {
     readonly deviceId: string;
     readonly error: BleErrorDetails | null;
   }) => void;
+  /** iOS: the peripheral's Service Changed; its handles under the changed services are gone. */
+  servicesChange: (event: {
+    readonly generation: number;
+    readonly deviceId: string;
+  }) => void;
 }
 
 /** Mirrors the annotated native surface; deliberately no React Native bridge types. */
@@ -175,4 +180,35 @@ export interface NativeBlePlx {
   ): Promise<NativeResult<NativePeripheral>>;
   setLogLevel(generation: number, level: LogLevel): Promise<NativeVoidResult>;
   logLevel(generation: number): Promise<NativeResult<string>>;
+  /**
+   * Android only: the system's bonds and the foreground service. Absent
+   * elsewhere. Properties, not methods: the session checks each is there
+   * and calls it with the module as `this`.
+   */
+  readonly bondState?: (
+    generation: number,
+    deviceId: string,
+  ) => Promise<NativeResult<string>>;
+  readonly removeBond?: (
+    generation: number,
+    deviceId: string,
+  ) => Promise<NativeResult<boolean>>;
+  readonly createBond?: (
+    generation: number,
+    deviceId: string,
+  ) => Promise<NativeResult<boolean>>;
+  readonly answerPairing?: (
+    generation: number,
+    deviceId: string,
+    passkey: string,
+    timeoutMs: number,
+  ) => Promise<NativeVoidResult>;
+  readonly startForegroundService?: (
+    generation: number,
+    title: string,
+    text: string,
+  ) => Promise<NativeVoidResult>;
+  readonly stopForegroundService?: (
+    generation: number,
+  ) => Promise<NativeVoidResult>;
 }

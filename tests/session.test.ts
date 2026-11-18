@@ -69,6 +69,7 @@ class FakeNative implements NativeBlePlx {
     scan: new Set(),
     notification: new Set(),
     disconnect: new Set(),
+    servicesChange: new Set(),
   };
   addListener<K extends keyof NativeEvents>(
     event: K,
@@ -516,4 +517,69 @@ test("native error details survive without JSON or untyped exception properties"
 test("UUID normalization rejects malformed identifiers", () => {
   expect(fullUUID("180F")).toBe("0000180f-0000-1000-8000-00805f9b34fb");
   expect(() => fullUUID("nope")).toThrow(BleError);
+});
+
+describe("android bonds and subscription readiness", () => {
+  class AndroidNative extends FakeNative {
+    bondState = mock(() => Promise.resolve(result("bonded")));
+    removeBond = mock(() => Promise.resolve(result(true)));
+    createBond = mock(() => Promise.resolve(result(true)));
+    answerPairing = mock(
+      (
+        _generation: number,
+        _id: string,
+        _passkey: string,
+        _timeoutMs: number,
+      ) => done(),
+    );
+    startForegroundService = mock(done);
+    stopForegroundService = mock(done);
+  }
+  test("a platform without bonds has none", async () => {
+    const session = await BleSession.open(new FakeNative());
+    expect(session.android).toBeNull();
+    await session.close();
+  });
+  test("bonds are validated, and a passkey is six digits before native work", async () => {
+    const native = new AndroidNative();
+    const session = await BleSession.open(native);
+    const android = session.android;
+    if (!android) throw new Error("no android bonds");
+    expect(await android.bondState(device.id)).toBe("bonded");
+    expect(await android.removeBond(device.id)).toBe(true);
+    await android.answerPairing(device.id, "812839");
+    expect(native.answerPairing).toHaveBeenCalledWith(
+      1,
+      device.id,
+      "812839",
+      30_000,
+    );
+    await expect(android.answerPairing(device.id, "8128")).rejects.toThrow(
+      BleError,
+    );
+    expect(native.answerPairing).toHaveBeenCalledTimes(1);
+    native.bondState.mockImplementation(() =>
+      Promise.resolve(result("paired?")),
+    );
+    await expect(android.bondState(device.id)).rejects.toThrow(BleError);
+    await session.close();
+  });
+  test("a monitor says when it is in place, and not after it is removed", async () => {
+    const { native, session, ref } = await setup();
+    const ready = mock(() => {});
+    session.monitor(ref, () => {}, { onReady: ready });
+    await flush();
+    await flush();
+    expect(ready).toHaveBeenCalledTimes(1);
+    const pending = deferred<{ generation: number; error: null }>();
+    native.startMonitor.mockImplementation(() => pending.promise);
+    const late = mock(() => {});
+    const removed = session.monitor(ref, () => {}, { onReady: late });
+    removed.remove();
+    pending.resolve({ generation: 1, error: null });
+    await flush();
+    await flush();
+    expect(late).not.toHaveBeenCalled();
+    await session.close();
+  });
 });

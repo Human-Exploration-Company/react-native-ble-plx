@@ -35,11 +35,14 @@ class BlePlxModule : Module() {
   private val monitors = mutableSetOf<String>()
   private val connectionTokens = mutableMapOf<String, Any>()
   private val pending = mutableMapOf<String, () -> Unit>()
+  private val bonds by lazy { Bonds(androidContext.applicationContext) }
+  private var foreground = false
 
   @Event(name = "stateChange") val stateChanged = event<StateEvent>()
   @Event(name = "scan") val scanResult = event<ScanEvent>()
   @Event(name = "notification") val notification = event<NotificationEvent>()
   @Event(name = "disconnect") val disconnected = event<DisconnectEvent>()
+  @Event(name = "servicesChange") val servicesChanged = event<ServicesChangeEvent>()
 
   @JS
   fun open(options: OpenOptions): Promise<OpenResult> {
@@ -211,17 +214,63 @@ class BlePlxModule : Module() {
         { done(VoidResult(generation)) }, { fail(it.record()) })
     }
 
+  /** Resolves once the peripheral has accepted the subscription; a refusal arrives as a notification error. */
   @JS
   fun startMonitor(generation: Int, handle: Int, subscriptionId: String, subscriptionType: String?): Promise<VoidResult> =
     request(generation, failed = { VoidResult(generation, it) }) { adapter, done, _ ->
       monitors.add(subscriptionId)
-      adapter.monitorCharacteristic(handle, subscriptionId, subscriptionType, { characteristic ->
+      adapter.monitorCharacteristic(handle, subscriptionId, subscriptionType, { done(VoidResult(generation)) }, { characteristic ->
         if (accept(generation) && monitors.contains(subscriptionId) && notification.isObserved) {
           notification(NotificationEvent(generation, subscriptionId, characteristic.value?.clone() ?: byteArrayOf()))
         }
       }, { error ->
         if (accept(generation) && monitors.remove(subscriptionId)) notification(NotificationEvent(generation, subscriptionId, error = error.record()))
+        done(VoidResult(generation))
       })
+    }
+
+  /** "none", "bonding" or "bonded". */
+  @JS
+  fun bondState(generation: Int, deviceId: String): Promise<StringResult> =
+    request(generation, failed = { StringResult(generation, error = it) }) { _, done, fail ->
+      val state = bonds.state(deviceId)
+      if (state == null) fail(BleFailure("DeviceNotFound", "Not a Bluetooth address", deviceId = deviceId))
+      else done(StringResult(generation, state))
+    }
+
+  @JS
+  fun removeBond(generation: Int, deviceId: String): Promise<BooleanResult> =
+    request(generation, failed = { BooleanResult(generation, error = it) }) { _, done, _ ->
+      done(BooleanResult(generation, bonds.remove(deviceId)))
+    }
+
+  @JS
+  fun createBond(generation: Int, deviceId: String): Promise<BooleanResult> =
+    request(generation, failed = { BooleanResult(generation, error = it) }) { _, done, _ ->
+      done(BooleanResult(generation, bonds.create(deviceId)))
+    }
+
+  /** Answers the device's pairing requests with `passkey` until its pairing ends; resolves once armed. */
+  @JS
+  fun answerPairing(generation: Int, deviceId: String, passkey: String, timeoutMs: Int): Promise<VoidResult> =
+    request(generation, failed = { VoidResult(generation, it) }) { _, done, fail ->
+      if (bonds.answer(deviceId, passkey, timeoutMs.toLong())) done(VoidResult(generation))
+      else fail(BleFailure("DeviceNotFound", "Not a Bluetooth address", deviceId = deviceId))
+    }
+
+  @JS
+  fun startForegroundService(generation: Int, title: String, text: String): Promise<VoidResult> =
+    request(generation, failed = { VoidResult(generation, it) }) { _, done, _ ->
+      BleForegroundService.start(androidContext.applicationContext, title, text)
+      foreground = true
+      done(VoidResult(generation))
+    }
+
+  @JS
+  fun stopForegroundService(generation: Int): Promise<VoidResult> =
+    request(generation, failed = { VoidResult(generation, it) }) { _, done, _ ->
+      BleForegroundService.stop(androidContext.applicationContext)
+      foreground = false
       done(VoidResult(generation))
     }
 
@@ -302,6 +351,9 @@ class BlePlxModule : Module() {
     val cancellations = pending.values.toList()
     pending.clear()
     cancellations.forEach { it() }
+    // A closed session holds no links, so nothing is left to keep alive.
+    if (foreground) BleForegroundService.stop(androidContext.applicationContext)
+    foreground = false
     active?.destroyClient()
   }
 

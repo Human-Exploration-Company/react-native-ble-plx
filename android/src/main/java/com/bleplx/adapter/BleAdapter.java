@@ -182,6 +182,15 @@ public interface BleAdapter {
     OnEventCallback<Characteristic> onEventCallback,
     OnErrorCallback onErrorCallback);
 
+  /** As above; {@code onReady} runs once the peripheral has accepted the subscription (its CCCD write). */
+  void monitorCharacteristic(
+    int characteristicIdentifier,
+    String transactionId,
+    String subscriptionType,
+    Runnable onReady,
+    OnEventCallback<Characteristic> onEventCallback,
+    OnErrorCallback onErrorCallback);
+
   void readDescriptorForDevice(
     final String deviceId,
     final String serviceUUID,

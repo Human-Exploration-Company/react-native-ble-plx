@@ -97,6 +97,9 @@ data class ScanEvent(val generation: Int, val scanId: String, val device: Periph
 data class NotificationEvent(val generation: Int, val subscriptionId: String, val value: ByteArray? = null, val error: BleFailure? = null)
 @Record
 data class DisconnectEvent(val generation: Int, val deviceId: String, val error: BleFailure? = null)
+/** Declared so the event set matches iOS; RxAndroidBle does not surface Service Changed, so it is never sent. */
+@Record
+data class ServicesChangeEvent(val generation: Int, val deviceId: String)
 
 internal fun BleError.record() = BleFailure(
   code = errorCode.name,
